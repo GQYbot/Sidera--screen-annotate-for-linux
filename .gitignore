@@ -1,0 +1,5 @@
+aarch64-sysroot/
+amd64-sysroot/
+*.deb
+annotate_aarch64
+annotate_amd64
