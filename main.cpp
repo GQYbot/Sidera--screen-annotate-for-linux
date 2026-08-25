@@ -124,7 +124,7 @@ struct AppState {
   // 多页缓存
   QMap<int, QPixmap*> slideCache;  // 页码 → 笔迹
   int currentSlide  = 1;           // 当前页码
-  int maxCachePages = 10;          // 非全屏 10 页，全屏 40 页
+  int maxCachePages = 2;           // 非全屏 2 页，全屏 30 页
 };
 
 static AppState g;
@@ -870,6 +870,9 @@ static void clearAllPages() {
   for (auto* pix : g.slideCache) delete pix;
   g.slideCache.clear();
   g.currentSlide = 1;
+  // 同时清空当前画布上的笔迹
+  if (g.canvas) g.canvas->fill(Qt::transparent);
+  if (g.mainWidget) g.mainWidget->update();
 }
 
 static void saveCurrentPage() {
@@ -963,10 +966,17 @@ static void checkWpsState() {
   if (needClose) XCloseDisplay(dpy);
 
   if (was != g.wpsFullscreen) {
-    qDebug() << "[INFO] 放映全屏状态:" << (g.wpsFullscreen ? "是" : "否");
-    // 进出全屏各清空一次缓存
-    clearAllPages();
-    g.maxCachePages = g.wpsFullscreen ? 40 : 10;
+    if (g.wpsFullscreen) {
+      // 进入全屏放映：清空所有笔迹 + 缓存上限 30 页
+      qDebug() << "[INFO] 进入全屏放映，清空笔迹";
+      clearAllPages();
+      g.maxCachePages = 30;
+    } else {
+      // 退出全屏放映：清空所有笔迹 + 缓存上限 2 页
+      qDebug() << "[INFO] 退出全屏放映，清空笔迹";
+      clearAllPages();
+      g.maxCachePages = 2;
+    }
   }
 
   // 翻页按钮始终显示
