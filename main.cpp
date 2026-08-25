@@ -864,9 +864,23 @@ static void sendXTestKey(Display* dpy, KeySym ks) {
 }
 
 // ============================================================
+// 合成器检测：无合成器时 X11 透明窗口会失效（显示不透明）
+// ============================================================
+static bool hasCompositor() {
+  Display* dpy = g.xDisplay;
+  bool nc = false;
+  if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
+  if (!dpy) return false;
+  Window cm = XGetSelectionOwner(dpy, XInternAtom(dpy, "_NET_WM_CM_S0", False));
+  if (nc) XCloseDisplay(dpy);
+  return cm != None;
+}
+
+// ============================================================
 // 多页缓存：翻页时保存/加载笔迹
 // ============================================================
 static void clearAllPages() {
+  qDebug() << "[INFO] clearAllPages 被调用，清空" << g.slideCache.size() << "页缓存 + 画布";
   for (auto* pix : g.slideCache) delete pix;
   g.slideCache.clear();
   g.currentSlide = 1;
@@ -923,8 +937,20 @@ static void goToNextPage() {
 /*
  * 全屏放映检测：扫描所有顶层窗口，找任何铺满屏幕的窗口
  * （不限于 WPS，OnlyOffice/LibreOffice 全屏也生效）
+ *
+ * 排除策略（防止把自己的全屏窗口误判，导致状态永不变化）：
+ *   1. XID 匹配
+ *   2. WM_CLASS 含 "annotate" / "screen-annotate"
+ *   3. override_redirect 窗口（我们的窗口是 override-redirect，WPS 全屏不是）
  */
 static bool isPresentationFullscreen(Display* dpy) {
+  Window selfWin = 0;
+  if (g.mainWidget) {
+    QWindow* wh = g.mainWidget->windowHandle();
+    if (wh) selfWin = (Window)wh->winId();
+    if (!selfWin) selfWin = (Window)g.mainWidget->winId();
+  }
+
   Window root = DefaultRootWindow(dpy);
   Window rootRet, parentRet, *children;
   unsigned int nChildren;
@@ -935,13 +961,27 @@ static bool isPresentationFullscreen(Display* dpy) {
 
   for (unsigned int i = 0; i < nChildren; i++) {
     Window w = children[i];
-    if (g.mainWidget && w == g.mainWidget->winId()) continue;
+    // 1. XID 排除自己
+    if (selfWin && w == selfWin) continue;
+
+    // 2. WM_CLASS 排除自己（XID 可能因 override-redirect 不匹配）
+    XClassHint cls;
+    if (XGetClassHint(dpy, w, &cls)) {
+      QString name = QString::fromLocal8Bit(cls.res_name).toLower();
+      QString klass = QString::fromLocal8Bit(cls.res_class).toLower();
+      XFree(cls.res_name); XFree(cls.res_class);
+      if (name.contains("annotate") || klass.contains("annotate") ||
+          name.contains("screen-annotate") || klass.contains("screen-annotate"))
+        continue;
+    }
 
     XWindowAttributes attrs;
     if (!XGetWindowAttributes(dpy, w, &attrs)) continue;
-    // 跳过未映射的窗口（map_state == IsUnmapped）
+    // 3. 跳过未映射的窗口
     if (attrs.map_state != IsViewable) continue;
-    // 跳过太小 / 太小的窗口（面板、图标等）
+    // 4. 跳过 override_redirect 窗口（我们的窗口；桌面组件也可能是）
+    if (attrs.override_redirect) continue;
+    // 5. 跳过太小 / 太小的窗口（面板、图标等）
     if (attrs.width < scr.width() - 8 || attrs.height < scr.height() - 8) continue;
 
     found = true; break;
@@ -964,6 +1004,9 @@ static void checkWpsState() {
   g.wpsFullscreen = isPresentationFullscreen(dpy);
 
   if (needClose) XCloseDisplay(dpy);
+
+  // 调试日志：每次检测都打印状态（方便确认检测是否工作）
+  qDebug() << "[WPS-DBG] was:" << was << "now:" << g.wpsFullscreen;
 
   if (was != g.wpsFullscreen) {
     if (g.wpsFullscreen) {
@@ -1051,6 +1094,12 @@ int main(int argc, char* argv[]) {
     int iy = (scr.height() - sbHeight()) / 2;
     g.sidebarScreenPos  = QPoint(4, iy);
     g.sidebarScreenPosR = QPoint(scr.width() - sbWidth() - 4, iy);
+  }
+
+  // 合成器检测：无合成器时透明画布会失效（显示不透明/黑屏）
+  if (!hasCompositor()) {
+    qWarning() << "[WARN] 未检测到 X11 合成器！透明画布将无法显示，批注会被不透明背景遮挡。"
+               << "请开启合成器，例如: picom &  或  xcompmgr &";
   }
   // 推迟到下一个事件循环：等 X11 处理完 show 再设输入形状
   QTimer::singleShot(200, []() {
