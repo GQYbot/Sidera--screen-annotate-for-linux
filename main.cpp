@@ -251,8 +251,8 @@ static int sbBtn()    { return int(38 * g.sbScale); }
 static int sbIcon()   { return int(28 * g.sbScale); }
 static int sbDot()    { return int(22 * g.sbScale); }
 static int sbRadius() { return sbWidth() / 2; }
-// 高度 = 固定 margins/spacing + 6 个按钮（间距 5 个 + 上下边距 18/14）
-static int sbHeight() { return 18 + 14 + 6 * sbBtn() + 5 * 8; }
+// 高度 = 固定 margins/spacing + 7 个按钮（间距 6 个 + 上下边距 18/14）
+static int sbHeight() { return 18 + 14 + 7 * sbBtn() + 6 * 8; }
 
 // ============================================================
 // 7b. 侧边栏拖动（子控件，在父窗口内自由移动）
@@ -447,6 +447,26 @@ public:
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(prevB);
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(nextB);
 
+    // 退出全屏按钮（⛶）——发送 ESC 键让焦点窗口退出全屏，左右各一个
+    auto mkFexit = []() {
+      QPushButton* b = new QPushButton(QString::fromUtf8("\342\233\266"));
+      b->setFixedSize(sbBtn(), sbBtn());
+      b->setStyleSheet(QString("QPushButton{background:#3a4a3a;color:#aaffaa;border:1.5px solid #66aa66;border-radius:%1px;font-size:%2px;font-weight:bold;}"
+                       "QPushButton:hover{background:#446644;color:#ffffff;}").arg(sbBtn()/2).arg(sbBtn()*12/19));
+      return b;
+    };
+    auto sendEsc = []() {
+      Display* dpy = g.xDisplay;
+      bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
+      if (dpy) { sendXTestKey(dpy, XK_Escape); if (nc) XCloseDisplay(dpy); }
+    };
+    QPushButton* fexitL = mkFexit();
+    QPushButton* fexitR = mkFexit();
+    QObject::connect(fexitL, &QPushButton::clicked, sendEsc);
+    QObject::connect(fexitR, &QPushButton::clicked, sendEsc);
+    qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(fexitL);
+    qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(fexitR);
+
     updateSidebarStyles();
   }
 
@@ -567,9 +587,6 @@ protected:
   }
 
   void keyPressEvent(QKeyEvent* ev) override {
-    if (ev->key() == Qt::Key_Escape) {
-      QApplication::quit();  // ESC 退出程序
-    }
     QWidget::keyPressEvent(ev);
   }
 
@@ -1042,12 +1059,6 @@ static void setupX11GlobalHotkey() {
     XGrabKey(dpy, kc, mods, g.xRootWin, True, GrabModeAsync, GrabModeAsync);
     XGrabKey(dpy, kc, mods|Mod2Mask|LockMask, g.xRootWin, True, GrabModeAsync, GrabModeAsync);
   }
-  // ESC：始终全局抓取，退出程序
-  KeyCode escKc = XKeysymToKeycode(dpy, XK_Escape);
-  if (escKc) {
-    XGrabKey(dpy, escKc, 0, g.xRootWin, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, escKc, Mod2Mask|LockMask, g.xRootWin, True, GrabModeAsync, GrabModeAsync);
-  }
   XFlush(dpy);
   int fd = ConnectionNumber(dpy);
   QSocketNotifier* n = new QSocketNotifier(fd, QSocketNotifier::Read);
@@ -1066,8 +1077,6 @@ static void processX11Hotkeys() {
           if (g.currentMode != 0) switchToCursorMode();
           else switchToDrawMode(1);
         }
-      } else if (ks == XK_Escape) {
-        QApplication::quit();  // ESC 退出程序
       }
     }
   }
