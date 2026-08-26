@@ -952,15 +952,25 @@ static void goToNextPage() {
 }
 
 /*
- * 全屏放映检测：扫描所有顶层窗口，找任何铺满屏幕的窗口
+ * 全屏放映检测：扫描所有顶层窗口，查 _NET_WM_STATE_FULLSCREEN 标志
  * （不限于 WPS，OnlyOffice/LibreOffice 全屏也生效）
  *
  * 排除策略（防止把自己的全屏窗口误判，导致状态永不变化）：
  *   1. XID 匹配
  *   2. WM_CLASS 含 "annotate" / "screen-annotate"
- *   3. override_redirect 窗口（我们的窗口是 override-redirect，WPS 全屏不是）
+ *
+ * 只认 FULLSCREEN 标志，不用几何尺寸兜底——
+ * 强制置顶的悬浮窗（ClassIsland 等）用 _NET_WM_STATE_ABOVE 置顶，不设 FULLSCREEN，不会误判。
  */
 static bool isPresentationFullscreen(Display* dpy) {
+  // 静态缓存 Atom，避免每 500ms 重复 Intern
+  static Atom netWmState = 0, netWmFullscreen = 0;
+  if (!netWmState) {
+    netWmState      = XInternAtom(dpy, "_NET_WM_STATE", False);
+    netWmFullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+  }
+
+  // 自己的窗口 XID
   Window selfWin = 0;
   if (g.mainWidget) {
     QWindow* wh = g.mainWidget->windowHandle();
@@ -973,7 +983,6 @@ static bool isPresentationFullscreen(Display* dpy) {
   unsigned int nChildren;
   if (!XQueryTree(dpy, root, &rootRet, &parentRet, &children, &nChildren) || !children) return false;
 
-  QRect scr = QGuiApplication::primaryScreen()->geometry();
   bool found = false;
 
   for (unsigned int i = 0; i < nChildren; i++) {
@@ -981,7 +990,7 @@ static bool isPresentationFullscreen(Display* dpy) {
     // 1. XID 排除自己
     if (selfWin && w == selfWin) continue;
 
-    // 2. WM_CLASS 排除自己（XID 可能因 override-redirect 不匹配）
+    // 2. WM_CLASS 排除自己
     XClassHint cls;
     if (XGetClassHint(dpy, w, &cls)) {
       QString name = QString::fromLocal8Bit(cls.res_name).toLower();
@@ -994,14 +1003,23 @@ static bool isPresentationFullscreen(Display* dpy) {
 
     XWindowAttributes attrs;
     if (!XGetWindowAttributes(dpy, w, &attrs)) continue;
-    // 3. 跳过未映射的窗口
     if (attrs.map_state != IsViewable) continue;
-    // 4. 跳过 override_redirect 窗口（我们的窗口；桌面组件也可能是）
-    if (attrs.override_redirect) continue;
-    // 5. 跳过太小 / 太小的窗口（面板、图标等）
-    if (attrs.width < scr.width() - 8 || attrs.height < scr.height() - 8) continue;
 
-    found = true; break;
+    // 3. 主判断：_NET_WM_STATE 含 FULLSCREEN
+    //    只用 FULLSCREEN 标志，不用几何尺寸兜底——
+    //    避免把强制置顶的悬浮窗（如 ClassIsland 课表，用 _NET_WM_STATE_ABOVE 置顶、不设 FULLSCREEN）
+    //    误判成放映，导致状态永不变化、从不清空
+    Atom actualType; int actualFormat; unsigned long nItems, bytesAfter; unsigned char* prop = nullptr;
+    if (XGetWindowProperty(dpy, w, netWmState, 0, 1024, False, XA_ATOM,
+                           &actualType, &actualFormat, &nItems, &bytesAfter, &prop) == Success && prop) {
+      Atom* atoms = (Atom*)prop;
+      for (unsigned long j = 0; j < nItems; j++) {
+        if (atoms[j] == netWmFullscreen) { found = true; break; }
+      }
+      XFree(prop);
+    }
+
+    if (found) break;
   }
 
   XFree(children);

@@ -1,13 +1,13 @@
 #!/bin/bash
 # amd64 deb 打包脚本
 # 用法: ./build_deb_amd64.sh
-# 产物: screen-annotate_1.0_amd64.deb
+# 产物: screen-annotate_1.3-Anemo_amd64.deb
 
 set -e
 
 BINARY="annotate_amd64"
 PKG_NAME="screen-annotate"
-VERSION="1.0"
+VERSION="1.3-Anemo"
 ARCH="amd64"
 
 if [ ! -f "$BINARY" ]; then
@@ -39,7 +39,7 @@ Maintainer: User <user@localhost>
 Depends: libqt5core5a (>= 5.12), libqt5gui5 (>= 5.12), libqt5widgets5 (>= 5.12), libx11-6, libxcb1, libxtst6, libxext6
 Description: 屏幕批注软件
  全屏透明画布批注工具，支持画笔/橡皮擦/直线，触控屏友好。
- 启动后显示左右两个胶囊形侧边栏，ESC 键退出程序。
+ 启动后显示左右两个胶囊形侧边栏，侧边栏 ⛶ 按钮可退出全屏。
 EOF
 
 # ---------- desktop 入口文件 ----------
@@ -57,8 +57,8 @@ EOF
 # ---------- 最小合法 PNG 图标 (1x1 透明) ----------
 printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\x00\x05\x05\x02\x00\x8f\x1e\x1f\x03\x99\x00\x00\x00\x00IEND\xaeB\x60\x82' > "${PKG_DIR}/usr/share/icons/hicolor/64x64/apps/screen-annotate.png"
 
-# ---------- 打包 ----------
-dpkg-deb --build "${PKG_DIR}"
+# ---------- 打包（--root-owner-group 消除 owner 警告）----------
+dpkg-deb --build --root-owner-group "${PKG_DIR}"
 
 echo ""
 echo "========== 打包完成 =========="
