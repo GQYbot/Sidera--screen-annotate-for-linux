@@ -50,6 +50,7 @@
 
 #include <cstdlib>
 #include <functional>
+#include <QSet>
 
 // ============================================================
 // 1. 全局状态
@@ -901,8 +902,26 @@ static void clearAllPages() {
   for (auto* pix : g.slideCache) delete pix;
   g.slideCache.clear();
   g.currentSlide = 1;
-  // 同时清空当前画布上的笔迹
-  if (g.canvas) g.canvas->fill(Qt::transparent);
+
+  // 重置绘图状态，防止残留（幽灵线 / 未完成的笔画）
+  g.isDrawing   = false;
+  g.linePreview = false;
+  g.lastPt  = QPoint();
+  g.lineStart = QPoint();
+
+  // 清空当前画布
+  if (g.canvas) {
+    g.canvas->fill(Qt::transparent);
+    // 诊断：抽点检查 canvas 是否真的全透明（定位是"没清"还是"清了没重绘"）
+    QImage img = g.canvas->toImage();
+    bool anyOpaque = false;
+    for (int y = 0; y < img.height() && !anyOpaque; y += 100)
+      for (int x = 0; x < img.width(); x += 100)
+        if (img.pixelColor(x, y).alpha() > 0) { anyOpaque = true; break; }
+    qDebug() << "[DIAG] canvas 清空检查: 还有不透明像素 = " << anyOpaque;
+  }
+
+  // 异步重绘（不用 repaint：同步重绘可能阻塞事件循环，导致翻页按钮点击丢失）
   if (g.mainWidget) g.mainWidget->update();
 }
 
@@ -930,8 +949,8 @@ static void loadPage(int page) {
 static void goToPrevPage() {
   saveCurrentPage();
   if (g.currentSlide > 1) g.currentSlide--;
-  // 全屏模式：发送 Up 键到放映窗口
-  if (g.wpsFullscreen) {
+  // 始终发送 Up 键（不依赖全屏检测，保证翻页虚拟按键一直可用）
+  {
     Display* dpy = g.xDisplay;
     bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
     if (dpy) { sendXTestKey(dpy, XK_Up); if (nc) XCloseDisplay(dpy); }
@@ -942,8 +961,8 @@ static void goToPrevPage() {
 static void goToNextPage() {
   saveCurrentPage();
   g.currentSlide++;
-  // 全屏模式：发送 Down 键到放映窗口
-  if (g.wpsFullscreen) {
+  // 始终发送 Down 键（不依赖全屏检测，保证翻页虚拟按键一直可用）
+  {
     Display* dpy = g.xDisplay;
     bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
     if (dpy) { sendXTestKey(dpy, XK_Down); if (nc) XCloseDisplay(dpy); }
@@ -952,15 +971,86 @@ static void goToNextPage() {
 }
 
 /*
- * 全屏放映检测：扫描所有顶层窗口，查 _NET_WM_STATE_FULLSCREEN 标志
- * （不限于 WPS，OnlyOffice/LibreOffice 全屏也生效）
+ * 判断窗口是否属于 WPS / OnlyOffice / LibreOffice
+ * （用 WM_CLASS 的 res_name / res_class 匹配，小写 contains）
+ */
+static bool isOfficeWindow(Display* dpy, Window w) {
+  XClassHint cls;
+  if (!XGetClassHint(dpy, w, &cls)) return false;
+  QString name  = QString::fromLocal8Bit(cls.res_name).toLower();
+  QString klass = QString::fromLocal8Bit(cls.res_class).toLower();
+  XFree(cls.res_name); XFree(cls.res_class);
+
+  // WPS 各组件 + OnlyOffice + LibreOffice
+  const char* keys[] = {
+    "wps", "wpp", "et", "wpspdf",          // WPS Office
+    "onlyoffice", "desktopeditors",        // OnlyOffice
+    "soffice", "impress", "libreoffice",   // LibreOffice
+    nullptr
+  };
+  for (int i = 0; keys[i]; i++)
+    if (name.contains(keys[i]) || klass.contains(keys[i])) return true;
+  return false;
+}
+
+/*
+ * 探测：递归遍历所有窗口，打印可见窗口的关键属性
+ * 用于定位 WPS/OnlyOffice 放映窗口（类名、尺寸、是否嵌套、是否 FULLSCREEN）
+ */
+static void probeWindows(Display* dpy) {
+  static Atom netWmState = 0, netWmFullscreen = 0;
+  if (!netWmState) {
+    netWmState      = XInternAtom(dpy, "_NET_WM_STATE", False);
+    netWmFullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+  }
+
+  std::function<void(Window, int)> walk = [&](Window w, int depth) {
+    XClassHint cls;
+    QString name = "?", klass = "?";
+    if (XGetClassHint(dpy, w, &cls)) {
+      name  = QString::fromLocal8Bit(cls.res_name);
+      klass = QString::fromLocal8Bit(cls.res_class);
+      XFree(cls.res_name); XFree(cls.res_class);
+    }
+
+    XWindowAttributes attrs;
+    if (XGetWindowAttributes(dpy, w, &attrs)) {
+      // 只打印可见窗口，减少噪音
+      if (attrs.map_state == IsViewable) {
+        bool fs = false;
+        Atom at; int af; unsigned long ni, ba; unsigned char* pr = nullptr;
+        if (XGetWindowProperty(dpy, w, netWmState, 0, 1024, False, XA_ATOM,
+                               &at, &af, &ni, &ba, &pr) == Success && pr) {
+          Atom* a = (Atom*)pr;
+          for (unsigned long j = 0; j < ni; j++) if (a[j] == netWmFullscreen) { fs = true; break; }
+          XFree(pr);
+        }
+        qDebug() << "[PROBE]" << QString(depth, QLatin1Char(' '))
+                 << "id=" << (unsigned long)w
+                 << "name=" << name << "class=" << klass
+                 << "size=" << attrs.width << "x" << attrs.height
+                 << "ovr=" << attrs.override_redirect
+                 << "FS=" << fs;
+      }
+    }
+
+    Window r, p, *ch; unsigned int n;
+    if (XQueryTree(dpy, w, &r, &p, &ch, &n) && ch) {
+      for (unsigned int i = 0; i < n; i++) walk(ch[i], depth + 1);
+      XFree(ch);
+    }
+  };
+
+  walk(DefaultRootWindow(dpy), 0);
+}
+
+/*
+ * 全屏放映检测（组合方案 + 递归遍历）：
+ *   1. 递归遍历所有顶层/嵌套窗口（WPS 放映窗口是嵌套窗口，XQueryTree(root) 只查直接子节点会漏掉）
+ *   2. 只检查 WPS/OnlyOffice/LibreOffice 窗口（WM_CLASS 白名单）——彻底隔离 ClassIsland 等悬浮窗
+ *   3. 对这些窗口：_NET_WM_STATE_FULLSCREEN 标志 或 几何尺寸铺满屏幕，任一命中即放映
  *
- * 排除策略（防止把自己的全屏窗口误判，导致状态永不变化）：
- *   1. XID 匹配
- *   2. WM_CLASS 含 "annotate" / "screen-annotate"
- *
- * 只认 FULLSCREEN 标志，不用几何尺寸兜底——
- * 强制置顶的悬浮窗（ClassIsland 等）用 _NET_WM_STATE_ABOVE 置顶，不设 FULLSCREEN，不会误判。
+ * 这样无论 WPS 在 kwin 下是设 FULLSCREEN 还是只铺满屏幕、窗口是否嵌套都能检测到。
  */
 static bool isPresentationFullscreen(Display* dpy) {
   // 静态缓存 Atom，避免每 500ms 重复 Intern
@@ -978,51 +1068,45 @@ static bool isPresentationFullscreen(Display* dpy) {
     if (!selfWin) selfWin = (Window)g.mainWidget->winId();
   }
 
-  Window root = DefaultRootWindow(dpy);
-  Window rootRet, parentRet, *children;
-  unsigned int nChildren;
-  if (!XQueryTree(dpy, root, &rootRet, &parentRet, &children, &nChildren) || !children) return false;
-
+  QRect scr = QGuiApplication::primaryScreen()->geometry();
   bool found = false;
 
-  for (unsigned int i = 0; i < nChildren; i++) {
-    Window w = children[i];
-    // 1. XID 排除自己
-    if (selfWin && w == selfWin) continue;
+  std::function<void(Window)> walk = [&](Window w) {
+    if (found) return;
+    if (selfWin && w == selfWin) return;  // 排除自己
 
-    // 2. WM_CLASS 排除自己
-    XClassHint cls;
-    if (XGetClassHint(dpy, w, &cls)) {
-      QString name = QString::fromLocal8Bit(cls.res_name).toLower();
-      QString klass = QString::fromLocal8Bit(cls.res_class).toLower();
-      XFree(cls.res_name); XFree(cls.res_class);
-      if (name.contains("annotate") || klass.contains("annotate") ||
-          name.contains("screen-annotate") || klass.contains("screen-annotate"))
-        continue;
-    }
-
-    XWindowAttributes attrs;
-    if (!XGetWindowAttributes(dpy, w, &attrs)) continue;
-    if (attrs.map_state != IsViewable) continue;
-
-    // 3. 主判断：_NET_WM_STATE 含 FULLSCREEN
-    //    只用 FULLSCREEN 标志，不用几何尺寸兜底——
-    //    避免把强制置顶的悬浮窗（如 ClassIsland 课表，用 _NET_WM_STATE_ABOVE 置顶、不设 FULLSCREEN）
-    //    误判成放映，导致状态永不变化、从不清空
-    Atom actualType; int actualFormat; unsigned long nItems, bytesAfter; unsigned char* prop = nullptr;
-    if (XGetWindowProperty(dpy, w, netWmState, 0, 1024, False, XA_ATOM,
-                           &actualType, &actualFormat, &nItems, &bytesAfter, &prop) == Success && prop) {
-      Atom* atoms = (Atom*)prop;
-      for (unsigned long j = 0; j < nItems; j++) {
-        if (atoms[j] == netWmFullscreen) { found = true; break; }
+    // 对当前窗口：若是办公软件且全屏 → 判定放映
+    if (isOfficeWindow(dpy, w)) {
+      XWindowAttributes attrs;
+      if (XGetWindowAttributes(dpy, w, &attrs) && attrs.map_state == IsViewable) {
+        // FULLSCREEN 标志
+        bool fullscreen = false;
+        Atom at; int af; unsigned long ni, ba; unsigned char* pr = nullptr;
+        if (XGetWindowProperty(dpy, w, netWmState, 0, 1024, False, XA_ATOM,
+                               &at, &af, &ni, &ba, &pr) == Success && pr) {
+          Atom* a = (Atom*)pr;
+          for (unsigned long j = 0; j < ni; j++) if (a[j] == netWmFullscreen) { fullscreen = true; break; }
+          XFree(pr);
+        }
+        // 几何尺寸兜底（kwin 下 WPS 可能不设 FULLSCREEN，只铺满屏幕）
+        if (!fullscreen) {
+          if (attrs.width >= scr.width() - 8 && attrs.height >= scr.height() - 8) {
+            fullscreen = true;
+          }
+        }
+        if (fullscreen) { found = true; return; }
       }
-      XFree(prop);
     }
 
-    if (found) break;
-  }
+    // 递归子窗口（放映窗口可能嵌套多层，必须深入遍历）
+    Window r, p, *ch; unsigned int n;
+    if (XQueryTree(dpy, w, &r, &p, &ch, &n) && ch) {
+      for (unsigned int i = 0; i < n; i++) walk(ch[i]);
+      XFree(ch);
+    }
+  };
 
-  XFree(children);
+  walk(DefaultRootWindow(dpy));
   return found;
 }
 
@@ -1042,6 +1126,16 @@ static void checkWpsState() {
 
   // 调试日志：每次检测都打印状态（方便确认检测是否工作）
   qDebug() << "[WPS-DBG] was:" << was << "now:" << g.wpsFullscreen;
+
+  // 定时探测窗口（每 30 次 = 15 秒一次），用于定位 WPS 放映窗口属性
+  static int probeCounter = 0;
+  if (++probeCounter % 30 == 0) {
+    qDebug() << "[PROBE] ===== 开始遍历可见窗口 =====";
+    Display* pd = dpy;
+    bool nc2 = false;
+    if (!pd) { pd = XOpenDisplay(nullptr); nc2 = true; }
+    if (pd) { probeWindows(pd); if (nc2) XCloseDisplay(pd); }
+  }
 
   if (was != g.wpsFullscreen) {
     if (g.wpsFullscreen) {
