@@ -27,6 +27,7 @@
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QPaintEvent>
+#include <QTouchEvent>
 #include <QMoveEvent>
 #include <QResizeEvent>
 #include <QScreen>
@@ -142,7 +143,6 @@ static void showPenPopup();
 static void showEraserPopup();
 static void repositionPopups();
 static void updateSidebarStyles();
-static void forceStayOnTop();
 static void setInputShapeToSidebar();
 static void resetInputShape();
 static void sendXTestKey(Display* dpy, KeySym ks);
@@ -225,7 +225,7 @@ protected:
       p.setRenderHint(QPainter::Antialiasing, true);
       QRectF r = w->rect().adjusted(1,1,-1,-1);
       qreal rad = r.width()/2.0;
-      p.setBrush(QColor(42,42,50,240));
+      p.setBrush(QColor(42,42,50,150));
       p.setPen(Qt::NoPen);
       p.drawRoundedRect(r, rad, rad);
       QLinearGradient g(r.topLeft(), QPointF(r.center().x(), r.top()+r.height()*0.45));
@@ -254,6 +254,24 @@ static int sbDot()    { return int(22 * g.sbScale); }
 static int sbRadius() { return sbWidth() / 2; }
 // 高度 = 固定 margins/spacing + 7 个按钮（间距 6 个 + 上下边距 18/14）
 static int sbHeight() { return 18 + 14 + 7 * sbBtn() + 6 * 8; }
+
+// 画一段笔迹到 g.canvas（画笔/橡皮擦共用，鼠标和触摸都调用）
+static void strokeToCanvas(QPoint a, QPoint b) {
+  if (!g.canvas) return;
+  QPainter p(g.canvas);
+  if (g.currentMode == 2) {
+    p.setCompositionMode(QPainter::CompositionMode_Clear);
+    QPen ep(Qt::transparent, g.eraserWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    p.setPen(ep);
+  } else {
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    QPen pen(g.penColor(), g.penWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    p.setPen(pen);
+    p.setRenderHint(QPainter::Antialiasing, true);
+  }
+  p.drawLine(a, b);
+  p.end();
+}
 
 // ============================================================
 // 7b. 侧边栏拖动（子控件，在父窗口内自由移动）
@@ -312,6 +330,7 @@ class MainWidget : public QWidget {
 public:
   explicit MainWidget() {
     setAttribute(Qt::WA_TranslucentBackground, true);
+    setAttribute(Qt::WA_AcceptTouchEvents, true);  // 接受触摸事件，手指触摸画线不依赖鼠标合成
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint
                    | Qt::WindowDoesNotAcceptFocus
                    | Qt::BypassWindowManagerHint);
@@ -345,7 +364,7 @@ public:
     sb->setObjectName("sidebarArea");
     sb->setStyleSheet(
       QString("#sidebarArea {"
-      "  background-color: rgba(42,42,50,240);"
+      "  background-color: rgba(42,42,50,150);"
       "  border: 2px solid #666666;"
       "  border-radius: %1px;"
       "}").arg(sbRadius())
@@ -545,22 +564,8 @@ protected:
     }
     if (!g.isDrawing || !g.canvas || g.currentMode == 0) return;
     QPoint cur = ev->pos();
-    QPoint prev = g.lastPt;  // 保留旧点用于计算包围盒
-    {
-      QPainter p(g.canvas);
-      if (g.currentMode == 2) {
-        p.setCompositionMode(QPainter::CompositionMode_Clear);
-        QPen ep(Qt::transparent, g.eraserWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-        p.setPen(ep);
-      } else {
-        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        QPen pen(g.penColor(), g.penWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-        p.setPen(pen);
-        p.setRenderHint(QPainter::Antialiasing, true);
-      }
-      p.drawLine(prev, cur);
-      p.end();
-    }
+    QPoint prev = g.lastPt;
+    strokeToCanvas(prev, cur);
     g.lastPt = cur;
     // 局部重绘：只刷新本段包围盒，大幅降低 VM 重绘开销
     int w = g.currentMode == 2 ? g.eraserWidth() : g.penWidth();
@@ -585,6 +590,71 @@ protected:
     Q_UNUSED(ev);
     if (g.isDrawing) { g.isDrawing = false; update(); }
     releaseMouse();
+  }
+
+  // 手指触摸画线：不经过 grabMouse（XGrabPointer 会让红外触摸的 move 事件丢失）
+  // QWidget 没有 touchEvent 虚函数，触摸事件走 event()
+  bool event(QEvent* ev) override {
+    if (ev->type() == QEvent::TouchBegin || ev->type() == QEvent::TouchUpdate ||
+        ev->type() == QEvent::TouchEnd) {
+      QTouchEvent* te = static_cast<QTouchEvent*>(ev);
+      const QList<QTouchEvent::TouchPoint>& pts = te->touchPoints();
+      QPoint cur = pts.isEmpty() ? QPoint() : pts.first().pos().toPoint();
+
+      // 触摸点在侧边栏/弹窗上 → 放行，让按钮/弹窗处理（否则触摸点击按钮会失效）
+      auto inWidget = [&](QWidget* w) {
+        return w && w->isVisible() && w->geometry().contains(cur);
+      };
+      if (inWidget(g.sidebarArea) || inWidget(g.sidebarAreaRight) ||
+          inWidget(g.penPopup) || inWidget(g.eraserPopup)) {
+        return QWidget::event(ev);
+      }
+
+      // 光标模式或画布无效 → 放行（不画线，交给默认处理）
+      if (g.currentMode == 0 || !g.canvas) return QWidget::event(ev);
+
+      switch (ev->type()) {
+        case QEvent::TouchBegin: {
+          if (g.currentMode == 3) {
+            g.lineStart = cur;
+            g.linePreview = true;
+            g.lastPt = cur;
+          } else {
+            g.isDrawing = true;
+            g.lastPt = cur;
+          }
+          break;
+        }
+        case QEvent::TouchUpdate: {
+          if (g.currentMode == 3) {
+            if (g.linePreview) { g.lastPt = cur; update(); }
+          } else if (g.isDrawing) {
+            QPoint prev = g.lastPt;
+            strokeToCanvas(prev, cur);
+            g.lastPt = cur;
+            int w = g.currentMode == 2 ? g.eraserWidth() : g.penWidth();
+            QRect dirty(QPoint(qMin(prev.x(), cur.x()), qMin(prev.y(), cur.y())),
+                        QPoint(qMax(prev.x(), cur.x()), qMax(prev.y(), cur.y())));
+            update(dirty.adjusted(-w, -w, w, w));
+          }
+          break;
+        }
+        case QEvent::TouchEnd: {
+          if (g.currentMode == 3 && g.linePreview) {
+            g.linePreview = false;
+            strokeToCanvas(g.lineStart, g.lastPt);
+            update();
+          } else if (g.isDrawing) {
+            g.isDrawing = false;
+            update();
+          }
+          break;
+        }
+        default: break;
+      }
+      return true;  // 接受触摸，避免再合成鼠标事件导致重复处理
+    }
+    return QWidget::event(ev);
   }
 
   void keyPressEvent(QKeyEvent* ev) override {
@@ -771,7 +841,7 @@ static void switchToDrawMode(int mode) {
   if (g.nextBtn) g.nextBtn->setVisible(true);
   resetInputShape();
 
-  qDebug() << "[INFO] 绘画模式:" << (mode == 1 ? "画笔" : "橡皮擦");
+  qDebug() << "[INFO] 绘画模式:" << (mode == 1 ? "画笔" : (mode == 2 ? "橡皮擦" : "直线"));
 }
 
 static void updateSidebarStyles() {
@@ -812,24 +882,8 @@ static void clearCanvas() {
 }
 
 // ============================================================
-// WPS 联动：翻页 + 全屏检测 + 强制置顶
+// WPS 联动：翻页 + 全屏检测
 // ============================================================
-/*
- * _NET_WM_STATE_ABOVE：比 WindowStaysOnTopHint 更强的置顶层
- * Plasma 点了别的窗口也不会把我们的窗口压下去
- */
-static void forceStayOnTop() {
-  if (!g.mainWidget || !g.mainWidget->windowHandle() || !g.mainWidget->isVisible()) return;
-  Display* dpy = g.xDisplay;
-  bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
-  if (!dpy) return;
-  Atom netWmState = XInternAtom(dpy, "_NET_WM_STATE", False);
-  Atom above = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
-  XChangeProperty(dpy, g.mainWidget->winId(), netWmState, XA_ATOM, 32,
-                  PropModeReplace, (unsigned char*)&above, 1);
-  XFlush(dpy);
-  if (nc) XCloseDisplay(dpy);
-}
 
 /*
  * XShape 输入区域：光标模式只让侧边栏 + 可见弹窗可点击，其余区域穿透桌面
@@ -910,16 +964,7 @@ static void clearAllPages() {
   g.lineStart = QPoint();
 
   // 清空当前画布
-  if (g.canvas) {
-    g.canvas->fill(Qt::transparent);
-    // 诊断：抽点检查 canvas 是否真的全透明（定位是"没清"还是"清了没重绘"）
-    QImage img = g.canvas->toImage();
-    bool anyOpaque = false;
-    for (int y = 0; y < img.height() && !anyOpaque; y += 100)
-      for (int x = 0; x < img.width(); x += 100)
-        if (img.pixelColor(x, y).alpha() > 0) { anyOpaque = true; break; }
-    qDebug() << "[DIAG] canvas 清空检查: 还有不透明像素 = " << anyOpaque;
-  }
+  if (g.canvas) g.canvas->fill(Qt::transparent);
 
   // 异步重绘（不用 repaint：同步重绘可能阻塞事件循环，导致翻页按钮点击丢失）
   if (g.mainWidget) g.mainWidget->update();
@@ -991,57 +1036,6 @@ static bool isOfficeWindow(Display* dpy, Window w) {
   for (int i = 0; keys[i]; i++)
     if (name.contains(keys[i]) || klass.contains(keys[i])) return true;
   return false;
-}
-
-/*
- * 探测：递归遍历所有窗口，打印可见窗口的关键属性
- * 用于定位 WPS/OnlyOffice 放映窗口（类名、尺寸、是否嵌套、是否 FULLSCREEN）
- */
-static void probeWindows(Display* dpy) {
-  static Atom netWmState = 0, netWmFullscreen = 0;
-  if (!netWmState) {
-    netWmState      = XInternAtom(dpy, "_NET_WM_STATE", False);
-    netWmFullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
-  }
-
-  std::function<void(Window, int)> walk = [&](Window w, int depth) {
-    XClassHint cls;
-    QString name = "?", klass = "?";
-    if (XGetClassHint(dpy, w, &cls)) {
-      name  = QString::fromLocal8Bit(cls.res_name);
-      klass = QString::fromLocal8Bit(cls.res_class);
-      XFree(cls.res_name); XFree(cls.res_class);
-    }
-
-    XWindowAttributes attrs;
-    if (XGetWindowAttributes(dpy, w, &attrs)) {
-      // 只打印可见窗口，减少噪音
-      if (attrs.map_state == IsViewable) {
-        bool fs = false;
-        Atom at; int af; unsigned long ni, ba; unsigned char* pr = nullptr;
-        if (XGetWindowProperty(dpy, w, netWmState, 0, 1024, False, XA_ATOM,
-                               &at, &af, &ni, &ba, &pr) == Success && pr) {
-          Atom* a = (Atom*)pr;
-          for (unsigned long j = 0; j < ni; j++) if (a[j] == netWmFullscreen) { fs = true; break; }
-          XFree(pr);
-        }
-        qDebug() << "[PROBE]" << QString(depth, QLatin1Char(' '))
-                 << "id=" << (unsigned long)w
-                 << "name=" << name << "class=" << klass
-                 << "size=" << attrs.width << "x" << attrs.height
-                 << "ovr=" << attrs.override_redirect
-                 << "FS=" << fs;
-      }
-    }
-
-    Window r, p, *ch; unsigned int n;
-    if (XQueryTree(dpy, w, &r, &p, &ch, &n) && ch) {
-      for (unsigned int i = 0; i < n; i++) walk(ch[i], depth + 1);
-      XFree(ch);
-    }
-  };
-
-  walk(DefaultRootWindow(dpy), 0);
 }
 
 /*
@@ -1123,19 +1117,6 @@ static void checkWpsState() {
   g.wpsFullscreen = isPresentationFullscreen(dpy);
 
   if (needClose) XCloseDisplay(dpy);
-
-  // 调试日志：每次检测都打印状态（方便确认检测是否工作）
-  qDebug() << "[WPS-DBG] was:" << was << "now:" << g.wpsFullscreen;
-
-  // 定时探测窗口（每 30 次 = 15 秒一次），用于定位 WPS 放映窗口属性
-  static int probeCounter = 0;
-  if (++probeCounter % 30 == 0) {
-    qDebug() << "[PROBE] ===== 开始遍历可见窗口 =====";
-    Display* pd = dpy;
-    bool nc2 = false;
-    if (!pd) { pd = XOpenDisplay(nullptr); nc2 = true; }
-    if (pd) { probeWindows(pd); if (nc2) XCloseDisplay(pd); }
-  }
 
   if (was != g.wpsFullscreen) {
     if (g.wpsFullscreen) {

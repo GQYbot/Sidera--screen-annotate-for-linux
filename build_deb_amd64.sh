@@ -1,13 +1,13 @@
 #!/bin/bash
 # amd64 deb 打包脚本
 # 用法: ./build_deb_amd64.sh
-# 产物: screen-annotate_1.3-Anemo_amd64.deb
+# 产物: screen-annotate_2.0-Geo_amd64.deb
 
 set -e
 
 BINARY="annotate_amd64"
 PKG_NAME="screen-annotate"
-VERSION="1.3-Anemo"
+VERSION="2.0-Geo"
 ARCH="amd64"
 
 if [ ! -f "$BINARY" ]; then
