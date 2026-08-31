@@ -225,7 +225,7 @@ protected:
       p.setRenderHint(QPainter::Antialiasing, true);
       QRectF r = w->rect().adjusted(1,1,-1,-1);
       qreal rad = r.width()/2.0;
-      p.setBrush(QColor(42,42,50,150));
+      p.setBrush(QColor(42,42,50,200));
       p.setPen(Qt::NoPen);
       p.drawRoundedRect(r, rad, rad);
       QLinearGradient g(r.topLeft(), QPointF(r.center().x(), r.top()+r.height()*0.45));
@@ -317,6 +317,8 @@ protected:
     } else if (ev->type() == QEvent::MouseButtonRelease && dragging) {
       dragging = false;
       if (w) w->releaseMouse();
+      // 拖动后侧边栏位置变了，重新设置输入区域，避免点击穿透
+      if (g.currentMode == 0) setInputShapeToSidebar();
       return true;
     }
     return QObject::eventFilter(obj, ev);
@@ -364,7 +366,7 @@ public:
     sb->setObjectName("sidebarArea");
     sb->setStyleSheet(
       QString("#sidebarArea {"
-      "  background-color: rgba(42,42,50,150);"
+      "  background-color: rgba(42,42,50,200);"
       "  border: 2px solid #666666;"
       "  border-radius: %1px;"
       "}").arg(sbRadius())
@@ -601,17 +603,17 @@ protected:
       const QList<QTouchEvent::TouchPoint>& pts = te->touchPoints();
       QPoint cur = pts.isEmpty() ? QPoint() : pts.first().pos().toPoint();
 
-      // 触摸点在侧边栏/弹窗上 → 放行，让按钮/弹窗处理（否则触摸点击按钮会失效）
+      // 触摸点在侧边栏/弹窗上 → 不画线，返回 false 让 Qt 合成鼠标给正确的子控件（按钮）
       auto inWidget = [&](QWidget* w) {
         return w && w->isVisible() && w->geometry().contains(cur);
       };
       if (inWidget(g.sidebarArea) || inWidget(g.sidebarAreaRight) ||
           inWidget(g.penPopup) || inWidget(g.eraserPopup)) {
-        return QWidget::event(ev);
+        return false;
       }
 
-      // 光标模式或画布无效 → 放行（不画线，交给默认处理）
-      if (g.currentMode == 0 || !g.canvas) return QWidget::event(ev);
+      // 光标模式或画布无效 → 不画线，返回 false（Qt 合成鼠标或穿透桌面）
+      if (g.currentMode == 0 || !g.canvas) return false;
 
       switch (ev->type()) {
         case QEvent::TouchBegin: {
