@@ -38,6 +38,11 @@
 #include <QFrame>
 #include <QTimer>
 #include <QMap>
+#include <QSlider>
+#include <QFile>
+#include <QTextStream>
+#include <QStandardPaths>
+#include <QDir>
 #include <QWindow>
 
 #include <X11/Xlib.h>
@@ -111,6 +116,10 @@ struct AppState {
 
   // 侧边栏缩放系数（0.6 ~ 1.4，1.0 为默认）
   double sbScale = 1.0;
+  // 侧边栏背景透明度（30 ~ 255，255=不透明）
+  int sidebarAlpha = 80;
+  // 设置窗口指针
+  QWidget* settingsWin = nullptr;
 
   // 平台
   QString platform  = "unknown";
@@ -150,6 +159,8 @@ static void goToPrevPage();
 static void goToNextPage();
 static void clearAllPages();
 static QWidget* createPopup(int w, int h);
+static void openSettings();
+static void closeSettings();
 
 // ============================================================
 // 3. 平台检测
@@ -225,7 +236,7 @@ protected:
       p.setRenderHint(QPainter::Antialiasing, true);
       QRectF r = w->rect().adjusted(1,1,-1,-1);
       qreal rad = r.width()/2.0;
-      p.setBrush(QColor(42,42,50,200));
+      p.setBrush(QColor(42,42,50,g.sidebarAlpha));
       p.setPen(Qt::NoPen);
       p.drawRoundedRect(r, rad, rad);
       QLinearGradient g(r.topLeft(), QPointF(r.center().x(), r.top()+r.height()*0.45));
@@ -247,13 +258,12 @@ protected:
 // ============================================================
 // 7. 侧边栏尺寸参数（线性缩放，基准为 64px 宽 / 38px 按钮）
 // ============================================================
-static int sbWidth()  { return int(64 * g.sbScale); }
-static int sbBtn()    { return int(38 * g.sbScale); }
-static int sbIcon()   { return int(28 * g.sbScale); }
-static int sbDot()    { return int(22 * g.sbScale); }
-static int sbRadius() { return sbWidth() / 2; }
-// 高度 = 固定 margins/spacing + 7 个按钮（间距 6 个 + 上下边距 18/14）
-static int sbHeight() { return 18 + 14 + 7 * sbBtn() + 6 * 8; }
+static int sbWidth()  { return int(56 * g.sbScale); }
+static int sbBtn()    { return int(34 * g.sbScale); }
+static int sbIcon()   { return int(24 * g.sbScale); }
+static int sbDot()    { return int(19 * g.sbScale); }
+// 高度 = 固定 margins/spacing + 8 个按钮（间距 7 个 + 上下边距 18/14）
+static int sbHeight() { return 18 + 14 + 8 * sbBtn() + 7 * 8; }
 
 // 画一段笔迹到 g.canvas（画笔/橡皮擦共用，鼠标和触摸都调用）
 static void strokeToCanvas(QPoint a, QPoint b) {
@@ -288,6 +298,9 @@ protected:
     QWidget* w = qobject_cast<QWidget*>(obj);
     if (ev->type() == QEvent::MouseButtonPress) {
       QMouseEvent* me = static_cast<QMouseEvent*>(ev);
+      // 点击侧边栏时终止主画布的进行中笔画（鼠标画线拖到侧边栏上松开时，release 事件给侧边栏，主画布收不到）
+      g.isDrawing   = false;
+      g.linePreview = false;
       if (qobject_cast<QPushButton*>(w ? w->childAt(me->pos()) : nullptr)) return false;
       if (me->button() == Qt::LeftButton) {
         dragging = true;
@@ -365,11 +378,7 @@ public:
     sb->setFixedSize(sbWidth(), sbHeight());
     sb->setObjectName("sidebarArea");
     sb->setStyleSheet(
-      QString("#sidebarArea {"
-      "  background-color: rgba(42,42,50,200);"
-      "  border: 2px solid #666666;"
-      "  border-radius: %1px;"
-      "}").arg(sbRadius())
+      "#sidebarArea { background: transparent; }"
     );
     sb->installEventFilter(new SidebarPainter(sb));
 
@@ -489,6 +498,21 @@ public:
     qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(fexitL);
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(fexitR);
 
+    // 设置按钮（⚙）——打开独立设置窗口，左右各一个
+    auto mkSet = []() {
+      QPushButton* b = new QPushButton(QString::fromUtf8("\342\232\231"));
+      b->setFixedSize(sbBtn(), sbBtn());
+      b->setStyleSheet(QString("QPushButton{background:#3a4a4a;color:#aaddee;border:1.5px solid #55aacc;border-radius:%1px;font-size:%2px;font-weight:bold;}"
+                       "QPushButton:hover{background:#446666;color:#ffffff;}").arg(sbBtn()/2).arg(sbBtn()*12/19));
+      return b;
+    };
+    QPushButton* setL = mkSet();
+    QPushButton* setR = mkSet();
+    QObject::connect(setL, &QPushButton::clicked, []() { openSettings(); });
+    QObject::connect(setR, &QPushButton::clicked, []() { openSettings(); });
+    qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(setL);
+    qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(setR);
+
     updateSidebarStyles();
   }
 
@@ -515,7 +539,12 @@ public:
     if (g.currentMode == 3) { return; }
     closeAllPopups();
     if (g.currentMode == 0) switchToDrawMode(3);
-    else g.currentMode = 3;
+    else {
+      // 直接从画笔/橡皮切到直线：重置画线状态，防止残留
+      g.isDrawing   = false;
+      g.linePreview = false;
+      g.currentMode = 3;
+    }
     updateSidebarStyles();
   }
 
@@ -546,7 +575,6 @@ protected:
         g.lineStart = ev->pos();
         g.linePreview = true;
         g.lastPt = ev->pos();
-        grabMouse();  // 锁定鼠标，VM 下光标出界也能持续收事件
       }
       return;
     }
@@ -554,7 +582,6 @@ protected:
     if (ev->button() == Qt::LeftButton) {
       g.isDrawing = true;
       g.lastPt   = ev->pos();
-      grabMouse();
     }
   }
 
@@ -586,12 +613,10 @@ protected:
       p.drawLine(g.lineStart, g.lastPt);
       p.end();
       update();
-      releaseMouse();
       return;
     }
     Q_UNUSED(ev);
     if (g.isDrawing) { g.isDrawing = false; update(); }
-    releaseMouse();
   }
 
   // 手指触摸画线：不经过 grabMouse（XGrabPointer 会让红外触摸的 move 事件丢失）
@@ -604,11 +629,14 @@ protected:
       QPoint cur = pts.isEmpty() ? QPoint() : pts.first().pos().toPoint();
 
       // 触摸点在侧边栏/弹窗上 → 不画线，返回 false 让 Qt 合成鼠标给正确的子控件（按钮）
+      // 同时终止画线状态，防止画到侧边栏时状态泄漏（残留 isDrawing 导致合成鼠标继续画线）
       auto inWidget = [&](QWidget* w) {
         return w && w->isVisible() && w->geometry().contains(cur);
       };
       if (inWidget(g.sidebarArea) || inWidget(g.sidebarAreaRight) ||
           inWidget(g.penPopup) || inWidget(g.eraserPopup)) {
+        g.isDrawing   = false;
+        g.linePreview = false;
         return false;
       }
 
@@ -889,29 +917,48 @@ static void clearCanvas() {
 
 /*
  * XShape 输入区域：光标模式只让侧边栏 + 可见弹窗可点击，其余区域穿透桌面
+ *
+ * 用 XShapeCombineMask（1bit 位图）实现：黑=穿透，白=可输入。
+ * 比 XShapeCombineRectangles 更基础可靠——后者在部分驱动下矩形合并/排序会静默失败，
+ * 导致覆盖漂移（侧边栏部分按键穿透 / 画布偶尔不穿透）。
  */
 static void setInputShapeToSidebar() {
   if (!g.mainWidget || !g.mainWidget->isVisible()) return;
   Display* dpy = g.xDisplay;
   bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
   if (!dpy) return;
-  XRectangle rects[8];
-  int n = 0;
-  auto addRect = [&](QWidget* w) {
+
+  int winW = g.mainWidget->width();
+  int winH = g.mainWidget->height();
+  if (winW <= 0 || winH <= 0) { if (nc) XCloseDisplay(dpy); return; }
+
+  // 创建 1bit 掩码位图
+  Window wnd = (Window)g.mainWidget->winId();
+  Pixmap mask = XCreatePixmap(dpy, wnd, winW, winH, 1);
+  GC gc = XCreateGC(dpy, mask, 0, nullptr);
+  // 全部置黑（默认穿透）
+  XSetForeground(dpy, gc, 0);
+  XFillRectangle(dpy, mask, gc, 0, 0, winW, winH);
+  // 侧边栏/弹窗区域置白（可输入）
+  XSetForeground(dpy, gc, 1);
+  auto fillWhite = [&](QWidget* w) {
     if (!w || !w->isVisible()) return;
     QPoint p = w->pos();
-    // 四周各留 6px 余量，兼容 VM/不同驱动的 XShape 边界偏差
-    rects[n].x = (short)qMax(0, p.x() - 6);
-    rects[n].y = (short)qMax(0, p.y() - 6);
-    rects[n].width  = (unsigned short)(w->width() + 12);
-    rects[n].height = (unsigned short)(w->height() + 12);
-    n++;
+    // 四周各留 4px 余量
+    int x = qMax(0, p.x() - 4);
+    int y = qMax(0, p.y() - 4);
+    int ww = w->width() + 8;
+    int wh = w->height() + 8;
+    XFillRectangle(dpy, mask, gc, x, y, ww, wh);
   };
-  addRect(g.sidebarArea);
-  addRect(g.sidebarAreaRight);
-  addRect(g.penPopup);
-  addRect(g.eraserPopup);
-  XShapeCombineRectangles(dpy, g.mainWidget->winId(), ShapeInput, 0, 0, rects, n, ShapeSet, YXBanded);
+  fillWhite(g.sidebarArea);
+  fillWhite(g.sidebarAreaRight);
+  fillWhite(g.penPopup);
+  fillWhite(g.eraserPopup);
+  XFreeGC(dpy, gc);
+
+  XShapeCombineMask(dpy, wnd, ShapeInput, 0, 0, mask, ShapeSet);
+  XFreePixmap(dpy, mask);
   XFlush(dpy);
   if (nc) XCloseDisplay(dpy);
 }
@@ -1137,6 +1184,9 @@ static void checkWpsState() {
   // 翻页按钮始终显示
   if (g.prevBtn) g.prevBtn->setVisible(true);
   if (g.nextBtn) g.nextBtn->setVisible(true);
+
+  // 光标模式下定期刷新输入区域，确保侧边栏可点击稳定（XShape 可能因时序/位置变化偶发失效）
+  if (g.currentMode == 0) setInputShapeToSidebar();
 }
 
 // ============================================================
@@ -1174,6 +1224,168 @@ static void processX11Hotkeys() {
         }
       }
     }
+  }
+}
+
+// ============================================================
+// 12. 设置面板（普通置顶窗口，打开时画布临时隐藏）
+// ============================================================
+
+// 重建两侧边栏（大小改变时调用），保留当前位置
+static void rebuildSidebars() {
+  if (!g.mainWidget) return;
+  int keepY = g.sidebarScreenPos.y();
+  MainWidget* mw = static_cast<MainWidget*>(g.mainWidget);
+  // 删除旧侧边栏
+  delete g.sidebarArea; g.sidebarArea = nullptr;
+  delete g.sidebarAreaRight; g.sidebarAreaRight = nullptr;
+  g.cursorBtn = g.penBtn = g.eraserBtn = g.lineBtn = nullptr;
+  g.cursorBtnR = g.penBtnR = g.eraserBtnR = g.lineBtnR = nullptr;
+  g.prevBtn = g.nextBtn = nullptr;
+  // 重建
+  mw->buildSidebar();
+  // 恢复贴边位置（Y 保留原值，约束在新高度内）
+  QRect scr = QGuiApplication::primaryScreen()->geometry();
+  int iy = qMin(qMax(keepY, 0), scr.height() - sbHeight());
+  g.sidebarArea->move(4, iy);
+  g.sidebarAreaRight->move(scr.width() - sbWidth() - 4, iy);
+  g.sidebarScreenPos  = QPoint(4, iy);
+  g.sidebarScreenPosR = QPoint(scr.width() - sbWidth() - 4, iy);
+  if (g.currentMode == 0) setInputShapeToSidebar();
+}
+
+// 开机自启动：检测 .desktop 是否存在于 autostart
+static QString autoStartPath() {
+  QString dir = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation) + "/autostart";
+  QDir().mkpath(dir);
+  return dir + "/screen-annotate.desktop";
+}
+static bool isAutoStart() {
+  return QFile::exists(autoStartPath());
+}
+static void setAutoStart(bool on) {
+  QString path = autoStartPath();
+  if (on) {
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+      QTextStream ts(&f);
+      ts << "[Desktop Entry]\n"
+         << "Type=Application\n"
+         << "Name=屏幕批注\n"
+         << "Comment=屏幕批注软件\n"
+         << "Exec=screen-annotate\n"
+         << "Terminal=false\n";
+      f.close();
+    }
+  } else {
+    QFile::remove(path);
+  }
+}
+
+// 设置窗口
+// 滑块行：滑块 + 数值标签
+static QHBoxLayout* makeSliderRow(QSlider* slider, QLabel* val) {
+  QHBoxLayout* row = new QHBoxLayout();
+  row->addWidget(slider, 1);
+  val->setFixedWidth(36);
+  val->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  val->setStyleSheet("color:#aaddff;font-weight:bold;");
+  row->addWidget(val);
+  return row;
+}
+
+static void openSettings() {
+  if (g.settingsWin) { g.settingsWin->raise(); g.settingsWin->activateWindow(); return; }
+  if (g.mainWidget) g.mainWidget->hide();  // 隐藏画布，让普通设置窗口不被 override-redirect 盖住
+
+  QWidget* win = new QWidget();
+  g.settingsWin = win;
+  win->setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint);
+  win->setWindowTitle(QString::fromUtf8("屏幕批注 - 设置"));
+  win->setFixedWidth(300);
+  win->setStyleSheet(
+    "QWidget{background:#2b2b33;color:#eee;font-size:14px;}"
+    "QLabel{color:#ccc;}"
+    "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}"
+    "QPushButton:hover{background:#555;}"
+    "QSlider::groove:horizontal{height:6px;background:#444;border-radius:3px;}"
+    "QSlider::sub-page:horizontal{background:#3377cc;border-radius:3px;}"
+    "QSlider::handle:horizontal{width:16px;margin:-5px 0;background:#fff;border-radius:8px;}"
+  );
+
+  QVBoxLayout* lay = new QVBoxLayout(win);
+  lay->setContentsMargins(16, 16, 16, 12);
+  lay->setSpacing(10);
+
+  // 透明度
+  lay->addWidget(new QLabel(QString::fromUtf8("侧边栏透明度")));
+  QSlider* alphaSlider = new QSlider(Qt::Horizontal);
+  alphaSlider->setRange(30, 255);
+  alphaSlider->setValue(g.sidebarAlpha);
+  QLabel* alphaVal = new QLabel(QString::number(g.sidebarAlpha));
+  QObject::connect(alphaSlider, &QSlider::valueChanged, [alphaVal](int v) {
+    g.sidebarAlpha = v;
+    alphaVal->setText(QString::number(v));
+    // 触发两侧边栏重绘（背景由 SidebarPainter 用 g.sidebarAlpha 画）
+    if (g.sidebarArea) g.sidebarArea->update();
+    if (g.sidebarAreaRight) g.sidebarAreaRight->update();
+  });
+  lay->addLayout(makeSliderRow(alphaSlider, alphaVal));
+
+  // 大小
+  lay->addWidget(new QLabel(QString::fromUtf8("侧边栏大小")));
+  QSlider* sizeSlider = new QSlider(Qt::Horizontal);
+  sizeSlider->setRange(60, 140);
+  sizeSlider->setValue(int(g.sbScale * 100));
+  QLabel* sizeVal = new QLabel(QString::number(g.sbScale, 'f', 1));
+  QObject::connect(sizeSlider, &QSlider::valueChanged, [sizeVal](int v) {
+    g.sbScale = v / 100.0;
+    sizeVal->setText(QString::number(g.sbScale, 'f', 1));
+    rebuildSidebars();
+  });
+  lay->addLayout(makeSliderRow(sizeSlider, sizeVal));
+
+  lay->addSpacing(4);
+
+  // 开机自启动切换按键
+  QPushButton* autoBtn = new QPushButton();
+  auto updateAutoBtn = [autoBtn]() {
+    bool on = isAutoStart();
+    autoBtn->setText(on ? QString::fromUtf8("开机自启动: 开") : QString::fromUtf8("开机自启动: 关"));
+    autoBtn->setStyleSheet(on ? "QPushButton{background:#2a6e3f;color:#fff;border:1px solid #3a8f55;border-radius:6px;padding:8px;}"
+                              : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
+  };
+  updateAutoBtn();
+  QObject::connect(autoBtn, &QPushButton::clicked, [autoBtn, updateAutoBtn]() {
+    setAutoStart(!isAutoStart());
+    updateAutoBtn();
+  });
+  lay->addWidget(autoBtn);
+
+  lay->addSpacing(6);
+
+  // 完成按钮
+  QPushButton* doneBtn = new QPushButton(QString::fromUtf8("完成"));
+  doneBtn->setStyleSheet("QPushButton{background:#3377cc;color:#fff;font-weight:bold;padding:10px;border-radius:6px;}"
+                         "QPushButton:hover{background:#4488dd;}");
+  QObject::connect(doneBtn, &QPushButton::clicked, []() { closeSettings(); });
+  lay->addWidget(doneBtn);
+
+  // 窗口关闭（点 X）也关闭设置并恢复画布
+  QObject::connect(win, &QWidget::destroyed, []() { g.settingsWin = nullptr; });
+
+  // 屏幕居中
+  win->adjustSize();
+  win->move(QGuiApplication::primaryScreen()->geometry().center() - win->rect().center());
+  win->show();
+}
+
+static void closeSettings() {
+  if (g.settingsWin) { g.settingsWin->close(); g.settingsWin = nullptr; }
+  if (g.mainWidget) {
+    g.mainWidget->show();
+    if (g.currentMode == 0) setInputShapeToSidebar();
+    else resetInputShape();
   }
 }
 

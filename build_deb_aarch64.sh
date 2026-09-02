@@ -1,13 +1,13 @@
 #!/bin/bash
 # arm64 deb 打包脚本
 # 用法: ./build_deb_aarch64.sh
-# 产物: screen-annotate_2.0-Geo_arm64.deb
+# 产物: screen-annotate_2.1-Geo_arm64.deb
 
 set -e
 
 BINARY="annotate_aarch64"
 PKG_NAME="screen-annotate"
-VERSION="2.0-Geo"
+VERSION="2.1-Geo"
 ARCH="arm64"
 
 if [ ! -f "$BINARY" ]; then
