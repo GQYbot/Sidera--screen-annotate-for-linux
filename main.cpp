@@ -43,6 +43,9 @@
 #include <QTextStream>
 #include <QStandardPaths>
 #include <QDir>
+#include <QDialog>
+#include <QTextEdit>
+#include <QSysInfo>
 #include <QWindow>
 
 #include <X11/Xlib.h>
@@ -161,6 +164,7 @@ static void clearAllPages();
 static QWidget* createPopup(int w, int h);
 static void openSettings();
 static void closeSettings();
+static void showSystemInfo();
 
 // ============================================================
 // 3. 平台检测
@@ -1364,6 +1368,13 @@ static void openSettings() {
 
   lay->addSpacing(6);
 
+  // 系统诊断按钮（用于定位旧驱动下的侧边栏/XShape 问题）
+  QPushButton* infoBtn = new QPushButton(QString::fromUtf8("系统诊断信息"));
+  infoBtn->setStyleSheet("QPushButton{background:#444;color:#ccc;padding:8px;border-radius:6px;}"
+                         "QPushButton:hover{background:#555;}");
+  QObject::connect(infoBtn, &QPushButton::clicked, []() { showSystemInfo(); });
+  lay->addWidget(infoBtn);
+
   // 完成按钮
   QPushButton* doneBtn = new QPushButton(QString::fromUtf8("完成"));
   doneBtn->setStyleSheet("QPushButton{background:#3377cc;color:#fff;font-weight:bold;padding:10px;border-radius:6px;}"
@@ -1387,6 +1398,79 @@ static void closeSettings() {
     if (g.currentMode == 0) setInputShapeToSidebar();
     else resetInputShape();
   }
+}
+
+// ============================================================
+// 系统诊断信息（用于定位旧驱动下 XShape/侧边栏问题）
+// ============================================================
+static QString collectSystemInfo() {
+  QString s;
+  s += "=== 系统环境诊断 ===\n";
+  QFile osf("/etc/os-release");
+  if (osf.open(QIODevice::ReadOnly)) {
+    while (!osf.atEnd()) {
+      QString line = QString::fromLocal8Bit(osf.readLine()).trimmed();
+      if (line.startsWith("PRETTY_NAME=")) s += "系统: " + line.mid(13) + "\n";
+    }
+    osf.close();
+  }
+  s += "架构: " + QString(QSysInfo::currentCpuArchitecture()) + "\n";
+  s += "内核: " + QString(QSysInfo::kernelType()) + " " + QString(QSysInfo::kernelVersion()) + "\n";
+  s += "Qt: " + QString(qVersion()) + "\n";
+  s += "XDG_SESSION_TYPE: " + QString::fromLocal8Bit(qgetenv("XDG_SESSION_TYPE")) + "\n";
+  s += "DISPLAY: " + QString::fromLocal8Bit(qgetenv("DISPLAY")) + "\n";
+  s += "合成器: " + QString(hasCompositor() ? "有" : "无") + "\n";
+
+  // X11 / XShape 扩展检查
+  Display* dpy = g.xDisplay;
+  bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
+  if (dpy) {
+    int evBase, errBase, major, minor;
+    if (XShapeQueryExtension(dpy, &evBase, &errBase) && XShapeQueryVersion(dpy, &major, &minor)) {
+      s += "XShape: 扩展可用 v" + QString::number(major) + "." + QString::number(minor) + "\n";
+    } else {
+      s += "XShape: 扩展不可用!\n";
+    }
+    if (nc) XCloseDisplay(dpy);
+  }
+
+  QScreen* sc = QGuiApplication::primaryScreen();
+  if (sc) s += "屏幕: " + QString::number(sc->geometry().width()) + "x" + QString::number(sc->geometry().height()) + "\n";
+
+  if (g.mainWidget) {
+    s += "模式: " + QString(g.currentMode == 0 ? "光标" : (g.currentMode == 1 ? "画笔" : (g.currentMode == 2 ? "橡皮" : "直线"))) + "\n";
+    s += "画布: 可见=" + QString(g.mainWidget->isVisible() ? "是" : "否")
+       + " pos=(" + QString::number(g.mainWidget->pos().x()) + "," + QString::number(g.mainWidget->pos().y()) + ")"
+       + " size=(" + QString::number(g.mainWidget->width()) + "x" + QString::number(g.mainWidget->height()) + ")"
+       + " override_redirect 窗口\n";
+  }
+  auto sbInfo = [&](const char* tag, QWidget* w) {
+    if (w)
+      s += QString(tag) + ": pos=(" + QString::number(w->pos().x()) + "," + QString::number(w->pos().y()) + ")"
+         + " size=(" + QString::number(w->width()) + "x" + QString::number(w->height()) + ")"
+         + " 可见=" + QString(w->isVisible() ? "是" : "否") + "\n";
+    else
+      s += QString(tag) + ": (空/未创建)\n";
+  };
+  sbInfo("左侧边栏", g.sidebarArea);
+  sbInfo("右侧边栏", g.sidebarAreaRight);
+  return s;
+}
+
+static void showSystemInfo() {
+  QDialog* dlg = new QDialog(g.settingsWin);
+  dlg->setWindowTitle(QString::fromUtf8("系统诊断信息"));
+  dlg->resize(500, 360);
+  QVBoxLayout* lay = new QVBoxLayout(dlg);
+  QTextEdit* te = new QTextEdit(dlg);
+  te->setReadOnly(true);
+  te->setPlainText(collectSystemInfo());
+  lay->addWidget(te);
+  QPushButton* close = new QPushButton(QString::fromUtf8("关闭"), dlg);
+  QObject::connect(close, &QPushButton::clicked, dlg, &QDialog::close);
+  lay->addWidget(close);
+  dlg->exec();
+  delete dlg;
 }
 
 // ============================================================
