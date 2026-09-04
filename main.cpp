@@ -932,28 +932,43 @@ static void setInputShapeToSidebar() {
   bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
   if (!dpy) return;
 
-  int winW = g.mainWidget->width();
-  int winH = g.mainWidget->height();
-  if (winW <= 0 || winH <= 0) { if (nc) XCloseDisplay(dpy); return; }
-
-  // 创建 1bit 掩码位图
   Window wnd = (Window)g.mainWidget->winId();
-  Pixmap mask = XCreatePixmap(dpy, wnd, winW, winH, 1);
+  // 真实 X 窗口物理尺寸。显示缩放/DPI>100% 时它 > Qt 逻辑尺寸（winId 窗口 =
+  // Qt 逻辑尺寸 × scale factor）。掩码必须按物理尺寸建并换算坐标，否则 1bit 位图
+  // 只覆盖窗口左上部分，右侧/底部无输入区域 → 点击穿透。
+  Window rootRet = None;
+  int rootX = 0, rootY = 0;
+  unsigned int XW = 0, XH = 0, bw = 0, depth = 0;
+  if (!XGetGeometry(dpy, wnd, &rootRet, &rootX, &rootY, &XW, &XH, &bw, &depth) ||
+      XW == 0 || XH == 0) {
+    if (nc) XCloseDisplay(dpy);
+    return;
+  }
+  int lw = g.mainWidget->width();
+  int lh = g.mainWidget->height();
+  if (lw <= 0 || lh <= 0) { if (nc) XCloseDisplay(dpy); return; }
+  // 逻辑像素 → 物理像素比例（1:1 缩放时为 1.0，行为与修复前一致）
+  double sx = double(XW) / double(lw);
+  double sy = double(XH) / double(lh);
+
+  // 创建 1bit 掩码位图（物理尺寸）
+  Pixmap mask = XCreatePixmap(dpy, wnd, XW, XH, 1);
   GC gc = XCreateGC(dpy, mask, 0, nullptr);
   // 全部置黑（默认穿透）
   XSetForeground(dpy, gc, 0);
-  XFillRectangle(dpy, mask, gc, 0, 0, winW, winH);
-  // 侧边栏/弹窗区域置白（可输入）
+  XFillRectangle(dpy, mask, gc, 0, 0, XW, XH);
+  // 侧边栏/弹窗区域置白（可输入）：子控件 pos/size 是逻辑值，换算成物理像素
   XSetForeground(dpy, gc, 1);
   auto fillWhite = [&](QWidget* w) {
     if (!w || !w->isVisible()) return;
     QPoint p = w->pos();
-    // 四周各留 4px 余量
-    int x = qMax(0, p.x() - 4);
-    int y = qMax(0, p.y() - 4);
-    int ww = w->width() + 8;
-    int wh = w->height() + 8;
-    XFillRectangle(dpy, mask, gc, x, y, ww, wh);
+    // 四周各留 4px 逻辑余量，随缩放换算
+    int x0 = qMax(0, qRound((p.x() - 4) * sx));
+    int y0 = qMax(0, qRound((p.y() - 4) * sy));
+    int ww = qMin(int(XW) - x0, qRound((w->width() + 8) * sx));
+    int wh = qMin(int(XH) - y0, qRound((w->height() + 8) * sy));
+    if (ww <= 0 || wh <= 0) return;
+    XFillRectangle(dpy, mask, gc, x0, y0, ww, wh);
   };
   fillWhite(g.sidebarArea);
   fillWhite(g.sidebarAreaRight);

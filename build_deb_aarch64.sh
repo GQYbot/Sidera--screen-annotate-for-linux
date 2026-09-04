@@ -7,7 +7,7 @@ set -e
 
 BINARY="annotate_aarch64"
 PKG_NAME="screen-annotate"
-VERSION="2.1-Geo"
+VERSION="2.1-Geo-stable"
 ARCH="arm64"
 
 if [ ! -f "$BINARY" ]; then

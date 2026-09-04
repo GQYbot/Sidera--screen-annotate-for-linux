@@ -7,7 +7,7 @@ set -e
 
 BINARY="annotate_amd64"
 PKG_NAME="screen-annotate"
-VERSION="2.1-Geo"
+VERSION="2.1-Geo-stable"
 ARCH="amd64"
 
 if [ ! -f "$BINARY" ]; then
