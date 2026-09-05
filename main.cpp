@@ -1301,6 +1301,16 @@ static void setAutoStart(bool on) {
   }
 }
 
+// 恢复被设置窗口隐藏的主画布并重建输入区域
+// 设置窗口可能以多种方式关闭：点标题栏 X、点“完成”。统一走这里收尾，
+// 否则主画布会一直隐藏、应用看起来“消失”。
+static void restoreCanvasAfterSettings() {
+  if (!g.mainWidget) return;
+  g.mainWidget->show();
+  if (g.currentMode == 0) setInputShapeToSidebar();
+  else resetInputShape();
+}
+
 // 设置窗口
 // 滑块行：滑块 + 数值标签
 static QHBoxLayout* makeSliderRow(QSlider* slider, QLabel* val) {
@@ -1319,6 +1329,8 @@ static void openSettings() {
 
   QWidget* win = new QWidget();
   g.settingsWin = win;
+  // 关闭即销毁：标题栏 X 也会触发 destroyed，从而执行恢复画布的回调
+  win->setAttribute(Qt::WA_DeleteOnClose, true);
   win->setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint);
   win->setWindowTitle(QString::fromUtf8("屏幕批注 - 设置"));
   win->setFixedWidth(300);
@@ -1397,8 +1409,11 @@ static void openSettings() {
   QObject::connect(doneBtn, &QPushButton::clicked, []() { closeSettings(); });
   lay->addWidget(doneBtn);
 
-  // 窗口关闭（点 X）也关闭设置并恢复画布
-  QObject::connect(win, &QWidget::destroyed, []() { g.settingsWin = nullptr; });
+  // 窗口关闭（点 X / 完成）恢复画布并复位指针
+  QObject::connect(win, &QWidget::destroyed, []() {
+    g.settingsWin = nullptr;
+    restoreCanvasAfterSettings();
+  });
 
   // 屏幕居中
   win->adjustSize();
@@ -1407,12 +1422,9 @@ static void openSettings() {
 }
 
 static void closeSettings() {
-  if (g.settingsWin) { g.settingsWin->close(); g.settingsWin = nullptr; }
-  if (g.mainWidget) {
-    g.mainWidget->show();
-    if (g.currentMode == 0) setInputShapeToSidebar();
-    else resetInputShape();
-  }
+  if (g.settingsWin) g.settingsWin->close();
+  g.settingsWin = nullptr;
+  restoreCanvasAfterSettings();
 }
 
 // ============================================================
