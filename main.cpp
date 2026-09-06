@@ -151,8 +151,8 @@ struct AppState {
   int currentSlide  = 1;           // 当前页码
   int maxCachePages = 2;           // 非全屏 2 页，全屏 30 页
 
-  // WPS 接口调试模式（实验）：翻页走本地 HTTP 16666，WPS 加载项回传真实页号/事件
-  bool         wpsDebug         = false;
+  // WPS 接口调试模式（教室默认开）：翻页走本地 HTTP 16666，WPS 加载项回传真实页号/事件
+  bool         wpsDebug         = true;
   bool         wpsConnected     = false;
   QTcpServer*  wpsServer        = nullptr;
   QTcpSocket*  wpsSock          = nullptr;   // 单个请求连接（HTTP 场景下基本不用）
@@ -1107,6 +1107,55 @@ static void wpsLog(const QString& msg) {
   }
 }
 
+// ---------------- 调试开关持久化 ----------------
+static QString wpsConfigFile() {
+  return QDir::homePath() + "/.config/screen-annotate/config";
+}
+static bool wpsConfigExists() { return QFile::exists(wpsConfigFile()); }
+// 返回 -1 表示无配置
+static int wpsLoadDebugSetting() {
+  QFile f(wpsConfigFile());
+  if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return -1;
+  QString s = QString::fromUtf8(f.readAll()).trimmed();
+  f.close();
+  return s == "wpsDebug=1" ? 1 : (s == "wpsDebug=0" ? 0 : -1);
+}
+static void wpsSaveDebugSetting(bool on) {
+  QDir().mkpath(QFileInfo(wpsConfigFile()).absolutePath());
+  QFile f(wpsConfigFile());
+  if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    QTextStream ts(&f);
+    ts << "wpsDebug=" << (on ? 1 : 0) << "\n";
+    f.close();
+  }
+}
+
+// ---------------- 加载项自动注册（写当前用户 jsaddons/publish.xml） ----------------
+static void ensureWpsAddinRegistered() {
+  QString path = QDir::homePath() + "/.local/share/Kingsoft/wps/jsaddons/publish.xml";
+  QString entry = "  <jspluginonline name=\"screen-annotate-bridge\" type=\"wpp\" "
+                  "url=\"http://127.0.0.1:16666/\" debug=\"\" enable=\"enable\" install=\"null\"/>\n";
+  QDir().mkpath(QFileInfo(path).absolutePath());
+  QFile f(path);
+  QString content;
+  if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    content = QString::fromUtf8(f.readAll());
+    f.close();
+  }
+  if (content.contains("screen-annotate-bridge")) { wpsLog("加载项已登记: " + path); return; }
+  if (!content.isEmpty() && content.contains("<jsplugins>") && content.contains("</jsplugins>"))
+    content.replace("</jsplugins>", entry + "</jsplugins>");
+  else
+    content = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<jsplugins>\n"
+            + entry + "</jsplugins>\n";
+  if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    QTextStream ts(&f);
+    ts << content;
+    f.close();
+    wpsLog("已自动登记加载项 → " + path);
+  }
+}
+
 static void wpsHandleHttp(QTcpSocket* s);
 static void wpsHttpReply(QTcpSocket* s, const QString& body);
 static void wpsServeAddinFile(QTcpSocket* s, const QString& path);
@@ -1204,11 +1253,22 @@ static void stopWpsApiServer() {
   wpsLog("调试服务已停止");
 }
 
-static void setWpsDebug(bool on) {
-  if (g.wpsDebug == on) return;
+static void setWpsDebug(bool on, bool persist = true) {
+  if (g.wpsDebug == on) {                     // 状态没变
+    if (on && !g.wpsServer) startWpsApiServer();
+    if (on && g.wpsServer) ensureWpsAddinRegistered();
+    if (persist) wpsSaveDebugSetting(on);
+    return;
+  }
   g.wpsDebug = on;
-  if (on) { startWpsApiServer(); }
-  else    { stopWpsApiServer(); g.wpsRealPos = -1; }
+  if (on) {
+    startWpsApiServer();
+    if (g.wpsServer) ensureWpsAddinRegistered();
+  } else {
+    stopWpsApiServer();
+    g.wpsRealPos = -1;
+  }
+  if (persist) wpsSaveDebugSetting(on);
 }
 
 // ============================================================
@@ -1680,7 +1740,7 @@ static void openSettings() {
                              : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
     wpsHint->setText(on ? QString::fromUtf8("开启中：按钮仍发虚拟键推进放映，但缓存改为按 WPS 加载项回传的"
                         "真实页号驱动——动画步不动缓存，只有真换页才存/载批注。日志: %1").arg(wpsLogFile())
-                        : QString::fromUtf8("实验功能：默认关闭=点击一次存一页（原逻辑）；开启后动画与真换页可区分。"));
+                        : QString::fromUtf8("关闭=点击一次存一页（原逻辑，兼容无加载项环境）。默认开启，状态会保存。"));
   };
   updateWpsBtn();
   QObject::connect(wpsBtn, &QPushButton::clicked, [wpsBtn, updateWpsBtn]() {
@@ -1840,8 +1900,18 @@ int main(int argc, char* argv[]) {
     delete g.iconLine; g.iconLine = nullptr;
   });
 
-  // 环境变量一键进入 WPS 接口调试模式（无界面/教室机自动化用）
-  if (qgetenv("WPS_API_DEBUG") == "1") setWpsDebug(true);
+  // 调试模式启动策略：环境变量 WPS_API_DEBUG > 配置文件 > 默认开(教室)
+  {
+    bool want = true;                          // 默认开
+    QString env = QString::fromLocal8Bit(qgetenv("WPS_API_DEBUG"));
+    if (!env.isEmpty()) { want = (env == "1"); }
+    else {
+      int saved = wpsLoadDebugSetting();
+      if (saved >= 0) want = (saved == 1);
+    }
+    // 无配置文件且默认开时不落盘；有配置才持久化
+    setWpsDebug(want, wpsConfigExists());
+  }
 
   return app.exec();
 }

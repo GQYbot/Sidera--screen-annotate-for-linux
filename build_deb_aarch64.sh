@@ -34,6 +34,10 @@ cp -r wps-addin/* "${PKG_DIR}/usr/share/screen-annotate/wps-addin/"
 chmod 755 "${PKG_DIR}/usr/share/screen-annotate/wps-addin/install.sh"
 install -m 755 wps-addin/install.sh "${PKG_DIR}/usr/bin/screen-annotate-wps-addin-install"
 
+# ---------- 教室部署说明文档 ----------
+mkdir -p "${PKG_DIR}/usr/share/doc/screen-annotate"
+cp README.classroom.md "${PKG_DIR}/usr/share/doc/screen-annotate/README.classroom.md"
+
 # ---------- DEBIAN/control ----------
 cat > "${PKG_DIR}/DEBIAN/control" << EOF
 Package: ${PKG_NAME}
