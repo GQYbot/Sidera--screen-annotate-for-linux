@@ -1142,7 +1142,7 @@ static void ensureWpsAddinRegistered() {
     content = QString::fromUtf8(f.readAll());
     f.close();
   }
-  if (content.contains("screen-annotate-bridge")) { wpsLog("加载项已登记: " + path); return; }
+  if (content.contains("screen-annotate-bridge")) return;   // 已登记，静默
   if (!content.isEmpty() && content.contains("<jsplugins>") && content.contains("</jsplugins>"))
     content.replace("</jsplugins>", entry + "</jsplugins>");
   else
@@ -1235,6 +1235,7 @@ static void startWpsApiServer() {
     if (g.wpsConnected &&
         QDateTime::currentMSecsSinceEpoch() - g.wpsLastSeen > 3000) {
       g.wpsConnected = false;
+      g.wpsRealPos = -1;                        // 离线：清掉旧“真实页号”，避免重连后误存错页
       wpsLog("客户端离线（3s 无请求）");
     }
   });
@@ -1242,6 +1243,7 @@ static void startWpsApiServer() {
 }
 
 static void stopWpsApiServer() {
+  bool wasRunning = g.wpsServer || g.wpsConnected || !g.wpsCmdQueue.isEmpty() || g.wpsPingTimer;
   if (g.wpsServer) {
     g.wpsServer->close();
     g.wpsServer->deleteLater();
@@ -1250,7 +1252,7 @@ static void stopWpsApiServer() {
   g.wpsPingTimer = nullptr;
   g.wpsConnected = false;
   g.wpsCmdQueue.clear();
-  wpsLog("调试服务已停止");
+  if (wasRunning) wpsLog("调试服务已停止");
 }
 
 static void setWpsDebug(bool on, bool persist = true) {
@@ -1373,8 +1375,7 @@ static void wpsServeAddinFile(QTcpSocket* s, const QString& path) {
 
 static void goToPrevPage() {
   // 调试模式：只“推进一步”，缓存由加载项回传的真实页号事件驱动（动画步不动缓存）
-  bool debugNoCache = g.wpsDebug && g.wpsConnected;
-  if (g.wpsDebug && !g.wpsConnected) wpsLog("调试模式但无客户端，退回默认行为（点击即缓存）");
+  bool debugNoCache = g.wpsDebug && g.wpsConnected;   // 无客户端时静默回退“点击即缓存”
   if (debugNoCache) wpsLog("调试：按钮仅发送 Up，缓存等待真实页号事件");
   if (!debugNoCache) {
     saveCurrentPage();
@@ -1391,8 +1392,7 @@ static void goToPrevPage() {
 
 static void goToNextPage() {
   // 调试模式：只“推进一步”，缓存由加载项回传的真实页号事件驱动（动画步不动缓存）
-  bool debugNoCache = g.wpsDebug && g.wpsConnected;
-  if (g.wpsDebug && !g.wpsConnected) wpsLog("调试模式但无客户端，退回默认行为（点击即缓存）");
+  bool debugNoCache = g.wpsDebug && g.wpsConnected;   // 无客户端时静默回退“点击即缓存”
   if (debugNoCache) wpsLog("调试：按钮仅发送 Down，缓存等待真实页号事件");
   if (!debugNoCache) {
     saveCurrentPage();
