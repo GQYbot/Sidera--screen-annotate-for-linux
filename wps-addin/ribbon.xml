@@ -1,0 +1,11 @@
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnAddinLoad">
+    <ribbon startFromScratch="false">
+        <tabs>
+            <tab id="saBridgeTab" label="批注联动">
+				<group id="saBridgeGroup" label="桥">
+                    <button id="btnSaPing" label="状态" onAction="OnSaPing" size="large"/>
+				</group>
+            </tab>
+        </tabs>
+    </ribbon>
+</customUI>

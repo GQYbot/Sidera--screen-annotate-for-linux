@@ -7,7 +7,7 @@ set -e
 
 BINARY="annotate_amd64"
 PKG_NAME="screen-annotate"
-VERSION="2.1-Geo-stable"
+VERSION="2.2-Geo-unstable"
 ARCH="amd64"
 
 if [ ! -f "$BINARY" ]; then
@@ -28,6 +28,12 @@ mkdir -p "${PKG_DIR}/usr/share/icons/hicolor/64x64/apps"
 cp "$BINARY" "${PKG_DIR}/usr/bin/screen-annotate"
 chmod 755 "${PKG_DIR}/usr/bin/screen-annotate"
 
+# ---------- 拷贝 WPS 加载项部署包（本 deb 已含桥接加载项 + 安装脚本）----------
+mkdir -p "${PKG_DIR}/usr/share/screen-annotate/wps-addin"
+cp -r wps-addin/* "${PKG_DIR}/usr/share/screen-annotate/wps-addin/"
+chmod 755 "${PKG_DIR}/usr/share/screen-annotate/wps-addin/install.sh"
+install -m 755 wps-addin/install.sh "${PKG_DIR}/usr/bin/screen-annotate-wps-addin-install"
+
 # ---------- DEBIAN/control ----------
 cat > "${PKG_DIR}/DEBIAN/control" << EOF
 Package: ${PKG_NAME}
@@ -40,6 +46,9 @@ Depends: libqt5core5a (>= 5.12), libqt5gui5 (>= 5.12), libqt5widgets5 (>= 5.12),
 Description: 屏幕批注软件
  全屏透明画布批注工具，支持画笔/橡皮擦/直线，触控屏友好。
  启动后显示左右两个胶囊形侧边栏，侧边栏 ⛶ 按钮可退出全屏。
+ 附带 WPS 演示联动加载项：设置里开启“WPS接口调试”后，
+ 批注缓存随真实换页驱动（页内动画不动批注）。
+ 安装后执行一次 screen-annotate-wps-addin-install 注册加载项。
 EOF
 
 # ---------- desktop 入口文件 ----------

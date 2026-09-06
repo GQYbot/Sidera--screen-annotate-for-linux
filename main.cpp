@@ -47,6 +47,17 @@
 #include <QTextEdit>
 #include <QSysInfo>
 #include <QWindow>
+#include <QDateTime>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QHostAddress>
+#include <QAbstractSocket>
+#include <QRegExp>
+#include <QQueue>
+#include <QUrl>
+#include <QUrlQuery>
+#include <QFileInfo>
+#include <QCoreApplication>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -139,6 +150,16 @@ struct AppState {
   QMap<int, QPixmap*> slideCache;  // 页码 → 笔迹
   int currentSlide  = 1;           // 当前页码
   int maxCachePages = 2;           // 非全屏 2 页，全屏 30 页
+
+  // WPS 接口调试模式（实验）：翻页走本地 HTTP 16666，WPS 加载项回传真实页号/事件
+  bool         wpsDebug         = false;
+  bool         wpsConnected     = false;
+  QTcpServer*  wpsServer        = nullptr;
+  QTcpSocket*  wpsSock          = nullptr;   // 单个请求连接（HTTP 场景下基本不用）
+  QTimer*      wpsPingTimer     = nullptr;   // 3s 无请求判离线
+  quint64      wpsLastSeen      = 0;
+  QQueue<QString> wpsCmdQueue;               // 待加载项取走的 NEXT/PREV
+  int          wpsRealPos       = -1;   // 加载项上报的真实页号（1 起）
 };
 
 static AppState g;
@@ -1059,28 +1080,271 @@ static void loadPage(int page) {
   if (g.mainWidget) g.mainWidget->update();
 }
 
+// ============================================================
+// WPS 接口调试模式（实验）：本地 HTTP 16666 + 日志
+// 核心思路：触发“下一步”的机制无所谓（假键/官方键都是同一件事），
+//   真正的区别在缓存时机。
+//   默认模式（调试关）：每点一次按钮 = 存一页并刷新（近似行为，多动画会错位）；
+//   调试模式（开 + 加载项已连）：按钮只发 Up/Down 推进放映，不做缓存；
+//     缓存改由加载项回传的真实页号事件驱动——真实换页才存旧页/载新页，
+//     页内动画步不动缓存 → 批注一直跟着真页走，动画不错位。
+//   没客户端连接时自动退回默认行为（点击即缓存），保证按钮始终可用。
+// ============================================================
+static QString wpsLogFile() {
+  QString dir = QDir::homePath();
+  if (!QFileInfo(dir).isWritable()) dir = "/tmp";
+  return dir + "/wps-api-debug.log";
+}
+
+static void wpsLog(const QString& msg) {
+  QString line = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz ") + msg;
+  qDebug().noquote() << "[WPSAPI]" << msg;
+  QFile f(wpsLogFile());
+  if (f.open(QIODevice::Append | QIODevice::Text)) {
+    QTextStream ts(&f);
+    ts << line << "\n";
+    f.close();
+  }
+}
+
+static void wpsHandleHttp(QTcpSocket* s);
+static void wpsHttpReply(QTcpSocket* s, const QString& body);
+static void wpsServeAddinFile(QTcpSocket* s, const QString& path);
+static void wpsTouch();
+
+// 加载项事件上报 → 同步批注页缓存。核心规则：
+//   真实页号变化(pos != 已知) → 保存旧页、载入新页；
+//   页号不变(动画步) → 缓存不动。
+static void wpsOnRealPos(int pos) {
+  if (pos <= 0) return;
+  if (g.wpsRealPos == pos) return;            // 还在同一页（动画步）
+  if (g.wpsRealPos > 0) {                     // 从旧页切走：保存旧页笔迹
+    g.currentSlide = g.wpsRealPos;
+    saveCurrentPage();
+  }
+  g.wpsRealPos = pos;
+  g.currentSlide = pos;
+  loadPage(pos);
+}
+
+static void wpsHandleLine(const QString& raw) {
+  QString line = raw.trimmed();
+  if (line.isEmpty()) return;
+  wpsLog("收 << " + line);
+  if (!line.startsWith("EVENT ")) return;
+  int pos = -1, click = -1;
+  QRegExp rxPos("pos=(\\d+)"), rxClick("click=(\\d+)");
+  if (rxPos.indexIn(line) >= 0) pos = rxPos.cap(1).toInt();
+  if (rxClick.indexIn(line) >= 0) click = rxClick.cap(1).toInt();
+  QString name = line.section(' ', 1, 1);
+  wpsLog(QString("事件 %1 pos=%2 click=%3").arg(name).arg(pos).arg(click));
+  if (name == "SlideShowBegin") {             // 放映开始：清空并落到第 1 页
+    clearAllPages();
+    g.wpsRealPos = pos > 0 ? pos : 1;
+    g.currentSlide = g.wpsRealPos;
+    if (g.mainWidget) g.mainWidget->update();
+    return;
+  }
+  if (pos > 0) wpsOnRealPos(pos);
+}
+
+static void wpsCloseClient() {
+  if (g.wpsSock) {
+    g.wpsSock->abort();
+    g.wpsSock->deleteLater();
+    g.wpsSock = nullptr;
+  }
+  if (g.wpsConnected) {
+    g.wpsConnected = false;
+    wpsLog("客户端断开");
+  }
+}
+
+static void startWpsApiServer() {
+  if (g.wpsServer) return;                     // 已在跑
+  QTcpServer* srv = new QTcpServer();
+  g.wpsServer = srv;
+  QObject::connect(srv, &QTcpServer::newConnection, []() {
+    while (g.wpsServer && g.wpsServer->hasPendingConnections()) {
+      QTcpSocket* s = g.wpsServer->nextPendingConnection();
+      QObject::connect(s, &QTcpSocket::readyRead, [s]() { wpsHandleHttp(s); });
+      QObject::connect(s, QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::error),
+                       [s](QAbstractSocket::SocketError) { s->deleteLater(); });
+    }
+  });
+  if (!srv->listen(QHostAddress::LocalHost, 16666)) {
+    wpsLog("HTTP 16666 绑定失败: " + srv->errorString());
+    srv->deleteLater();
+    g.wpsServer = nullptr;
+    return;
+  }
+  wpsLog("调试服务已启动，监听 127.0.0.1:16666 (HTTP)");
+  // 心跳：3 秒无请求视为加载项离线
+  QTimer* t = new QTimer(srv);
+  g.wpsPingTimer = t;
+  QObject::connect(t, &QTimer::timeout, []() {
+    if (g.wpsConnected &&
+        QDateTime::currentMSecsSinceEpoch() - g.wpsLastSeen > 3000) {
+      g.wpsConnected = false;
+      wpsLog("客户端离线（3s 无请求）");
+    }
+  });
+  t->start(1000);
+}
+
+static void stopWpsApiServer() {
+  if (g.wpsServer) {
+    g.wpsServer->close();
+    g.wpsServer->deleteLater();
+    g.wpsServer = nullptr;
+  }
+  g.wpsPingTimer = nullptr;
+  g.wpsConnected = false;
+  g.wpsCmdQueue.clear();
+  wpsLog("调试服务已停止");
+}
+
+static void setWpsDebug(bool on) {
+  if (g.wpsDebug == on) return;
+  g.wpsDebug = on;
+  if (on) { startWpsApiServer(); }
+  else    { stopWpsApiServer(); g.wpsRealPos = -1; }
+}
+
+// ============================================================
+// WPS 接口调试 HTTP 端点（供 Chromium 里的加载项调用）
+//   /hello?m=xx     加载项上线问候
+//   /push?m=<EVENT> 加载项上报事件（走 wpsHandleLine）
+//   /poll           加载项取走一条待执行指令（NEXT/PREV，无则空）
+//   跨域(CORS)已放开；任意请求即刷新“在线”心跳
+// ============================================================
+static void wpsTouch() {
+  g.wpsLastSeen = QDateTime::currentMSecsSinceEpoch();
+  if (!g.wpsConnected) { g.wpsConnected = true; wpsLog("客户端接入"); }
+}
+
+static void wpsHttpReply(QTcpSocket* s, const QString& body) {
+  QByteArray b = body.toUtf8();
+  QString resp =
+      "HTTP/1.1 200 OK\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
+      "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+      "Access-Control-Allow-Headers: *\r\n"
+      "Content-Type: text/plain; charset=utf-8\r\n"
+      "Content-Length: " + QString::number(b.size()) + "\r\n"
+      "Connection: close\r\n\r\n";
+  s->write(resp.toUtf8() + b);
+  s->flush();
+  s->disconnectFromHost();
+  s->deleteLater();
+}
+
+static void wpsHandleHttp(QTcpSocket* s) {
+  if (!s->canReadLine()) return;               // 还没收到完整请求行
+  QList<QByteArray> parts = s->readLine().split(' ');
+  if (parts.size() < 2) { s->deleteLater(); return; }
+  QByteArray method = parts[0];
+  QUrl url = QUrl::fromEncoded("http://x" + parts[1]);
+  QString path = url.path();
+  QString m = QUrlQuery(url).queryItemValue("m");
+  wpsTouch();                                   // 任意请求都算在线
+  if (method == "OPTIONS") { wpsHttpReply(s, ""); return; }
+  if (path == "/hello") {
+    wpsLog("加载项问候: " + m);
+    wpsHttpReply(s, "OK screen-annotate");
+    return;
+  }
+  if (path == "/push" && !m.isEmpty()) {
+    wpsHandleLine(m);
+    wpsHttpReply(s, "OK");
+    return;
+  }
+  if (path == "/poll") {
+    QString cmd = g.wpsCmdQueue.isEmpty() ? QString() : g.wpsCmdQueue.dequeue();
+    wpsHttpReply(s, cmd);
+    return;
+  }
+  // 其余路径：从加载项目录提供静态文件（manifest.xml/ribbon.xml/main.js/...）
+  wpsServeAddinFile(s, path);
+}
+
+// 加载项内容目录：环境变量 > 程序所在目录 > 系统安装目录
+static QString wpsAddinDir() {
+  QString env = QString::fromLocal8Bit(qgetenv("WPS_ADDIN_DIR"));
+  if (!env.isEmpty() && QFile::exists(env + "/manifest.xml")) return env;
+  QString app = QCoreApplication::applicationDirPath() + "/wps-addin";
+  if (QFile::exists(app + "/manifest.xml")) return app;
+  QString sys = "/usr/share/screen-annotate/wps-addin";
+  if (QFile::exists(sys + "/manifest.xml")) return sys;
+  return QString();
+}
+
+static void wpsServeAddinFile(QTcpSocket* s, const QString& path) {
+  QString dir = wpsAddinDir();
+  if (dir.isEmpty()) { wpsHttpReply(s, "OK"); return; }
+  QString rel = path.mid(1);                     // 去掉开头 '/'
+  if (rel.isEmpty()) rel = "manifest.xml";
+  // 防目录穿越：只允许纯文件名/一级 js/
+  if (rel.contains("..") || rel.contains("//")) { wpsHttpReply(s, "OK"); return; }
+  QString fp = dir + "/" + rel;
+  if (!QFile::exists(fp) || QFileInfo(fp).isDir()) { wpsHttpReply(s, "OK"); return; }
+  QFile f(fp);
+  if (!f.open(QIODevice::ReadOnly)) { wpsHttpReply(s, "OK"); return; }
+  QByteArray body = f.readAll();
+  f.close();
+  // 简单 Content-Type
+  QString ct = "text/plain";
+  if (rel.endsWith(".xml")) ct = "application/xml";
+  else if (rel.endsWith(".js")) ct = "text/javascript";
+  else if (rel.endsWith(".html") || rel.endsWith(".htm")) ct = "text/html";
+  else if (rel.endsWith(".svg")) ct = "image/svg+xml";
+  else if (rel.endsWith(".json")) ct = "application/json";
+  QString resp =
+      "HTTP/1.1 200 OK\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
+      "Content-Type: " + ct + "; charset=utf-8\r\n"
+      "Content-Length: " + QString::number(body.size()) + "\r\n"
+      "Connection: close\r\n\r\n";
+  s->write(resp.toUtf8() + body);
+  s->flush();
+  s->disconnectFromHost();
+  s->deleteLater();
+}
+
 static void goToPrevPage() {
-  saveCurrentPage();
-  if (g.currentSlide > 1) g.currentSlide--;
-  // 始终发送 Up 键（不依赖全屏检测，保证翻页虚拟按键一直可用）
+  // 调试模式：只“推进一步”，缓存由加载项回传的真实页号事件驱动（动画步不动缓存）
+  bool debugNoCache = g.wpsDebug && g.wpsConnected;
+  if (g.wpsDebug && !g.wpsConnected) wpsLog("调试模式但无客户端，退回默认行为（点击即缓存）");
+  if (debugNoCache) wpsLog("调试：按钮仅发送 Up，缓存等待真实页号事件");
+  if (!debugNoCache) {
+    saveCurrentPage();
+    if (g.currentSlide > 1) g.currentSlide--;
+  }
+  // 始终发送 Up 键（与假键语义一致：有动画时它就是“下一步”）
   {
     Display* dpy = g.xDisplay;
     bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
     if (dpy) { sendXTestKey(dpy, XK_Up); if (nc) XCloseDisplay(dpy); }
   }
-  loadPage(g.currentSlide);
+  if (!debugNoCache) loadPage(g.currentSlide);
 }
 
 static void goToNextPage() {
-  saveCurrentPage();
-  g.currentSlide++;
-  // 始终发送 Down 键（不依赖全屏检测，保证翻页虚拟按键一直可用）
+  // 调试模式：只“推进一步”，缓存由加载项回传的真实页号事件驱动（动画步不动缓存）
+  bool debugNoCache = g.wpsDebug && g.wpsConnected;
+  if (g.wpsDebug && !g.wpsConnected) wpsLog("调试模式但无客户端，退回默认行为（点击即缓存）");
+  if (debugNoCache) wpsLog("调试：按钮仅发送 Down，缓存等待真实页号事件");
+  if (!debugNoCache) {
+    saveCurrentPage();
+    g.currentSlide++;
+  }
+  // 始终发送 Down 键（与假键语义一致：有动画时它就是“下一步”）
   {
     Display* dpy = g.xDisplay;
     bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
     if (dpy) { sendXTestKey(dpy, XK_Down); if (nc) XCloseDisplay(dpy); }
   }
-  loadPage(g.currentSlide);
+  if (!debugNoCache) loadPage(g.currentSlide);
 }
 
 /*
@@ -1402,7 +1666,32 @@ static void openSettings() {
   QObject::connect(infoBtn, &QPushButton::clicked, []() { showSystemInfo(); });
   lay->addWidget(infoBtn);
 
-  // 完成按钮
+  lay->addSpacing(6);
+
+  // WPS 接口调试模式（实验）：翻页走本地 TCP 16666 + 加载项回传真实页号
+  QPushButton* wpsBtn = new QPushButton();
+  QLabel* wpsHint = new QLabel();
+  wpsHint->setWordWrap(true);
+  wpsHint->setStyleSheet("color:#667;font-size:11px;");
+  auto updateWpsBtn = [wpsBtn, wpsHint]() {
+    bool on = g.wpsDebug;
+    wpsBtn->setText(on ? QString::fromUtf8("WPS 接口调试: 开") : QString::fromUtf8("WPS 接口调试: 关"));
+    wpsBtn->setStyleSheet(on ? "QPushButton{background:#6a3f2a;color:#fff;border:1px solid #aa7a4a;border-radius:6px;padding:8px;}"
+                             : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
+    wpsHint->setText(on ? QString::fromUtf8("开启中：按钮仍发虚拟键推进放映，但缓存改为按 WPS 加载项回传的"
+                        "真实页号驱动——动画步不动缓存，只有真换页才存/载批注。日志: %1").arg(wpsLogFile())
+                        : QString::fromUtf8("实验功能：默认关闭=点击一次存一页（原逻辑）；开启后动画与真换页可区分。"));
+  };
+  updateWpsBtn();
+  QObject::connect(wpsBtn, &QPushButton::clicked, [wpsBtn, updateWpsBtn]() {
+    setWpsDebug(!g.wpsDebug);
+    updateWpsBtn();
+  });
+  lay->addWidget(wpsBtn);
+  lay->addWidget(wpsHint);
+
+  lay->addSpacing(6);
+
   QPushButton* doneBtn = new QPushButton(QString::fromUtf8("完成"));
   doneBtn->setStyleSheet("QPushButton{background:#3377cc;color:#fff;font-weight:bold;padding:10px;border-radius:6px;}"
                          "QPushButton:hover{background:#4488dd;}");
@@ -1542,6 +1831,7 @@ int main(int argc, char* argv[]) {
   checkWpsState();  // 立即执行一次
 
   QObject::connect(&app, &QApplication::aboutToQuit, []() {
+    stopWpsApiServer();
     clearAllPages();
     delete g.canvas; g.canvas = nullptr;
     delete g.iconCursor; g.iconCursor = nullptr;
@@ -1549,6 +1839,9 @@ int main(int argc, char* argv[]) {
     delete g.iconEraser; g.iconEraser = nullptr;
     delete g.iconLine; g.iconLine = nullptr;
   });
+
+  // 环境变量一键进入 WPS 接口调试模式（无界面/教室机自动化用）
+  if (qgetenv("WPS_API_DEBUG") == "1") setWpsDebug(true);
 
   return app.exec();
 }
