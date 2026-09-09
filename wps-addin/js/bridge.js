@@ -1,5 +1,5 @@
 // ============================================================
-// 屏幕批注联动桥（加载项内运行）
+// Sidera联动桥（加载项内运行）
 //   · 监听 WPS 放映事件 → 上报批注 app (127.0.0.1:16666 /push)
 //   · 轮询 /poll 取 NEXT/PREV 指令（保留，默认 app 用虚拟键推进）
 // 配合 app 的“WPS 接口调试模式”使用：批注缓存按真实页号驱动，
@@ -54,6 +54,20 @@ function bridgeCmd(cmd) {
     } catch (e) {}
 }
 var BridgeSlideEvents = ['SlideShowBegin', 'SlideShowEnd', 'SlideShowNextSlide', 'SlideShowNextClick', 'SlideShowOnNext', 'SlideShowOnPrevious'];
+// 轮询式状态上报：解决“上一页”没有后续新页号事件的问题
+// （WPS 的 Next 会补发 NextClick/NextSlide，但 Previous 常只有 OnPrevious 且带旧 pos）
+var _lastState = { pos: -1, click: -1 };
+function bridgePushIfChanged() {
+    try {
+        var st = bridgeState()
+        if (st.pos < 1) return                       // 不在放映
+        if (st.pos !== _lastState.pos || st.click !== _lastState.click) {
+            _lastState.pos = st.pos
+            _lastState.click = st.click
+            bridgeFetch('/push?m=' + encodeURIComponent('EVENT SlideShowState pos=' + st.pos + ' click=' + st.click))
+        }
+    } catch (e) {}
+}
 function startBridge() {
     if (typeof window.Application == 'undefined' || !window.Application) {
         setTimeout(startBridge, 500)          // 等 Application 就绪
@@ -69,7 +83,10 @@ function startBridge() {
                 })
             })(BridgeSlideEvents[i])
         }
-        bridgeFetch('/hello?m=screen-annotate-bridge')
-        setInterval(function () { bridgeFetch('/poll') }, 400)
+        bridgeFetch('/hello?m=sidera-bridge')
+        setInterval(function () {
+            bridgeFetch('/poll')
+            bridgePushIfChanged()              // 状态变化即上报（前后翻都覆盖）
+        }, 300)
     } catch (e) {}
 }

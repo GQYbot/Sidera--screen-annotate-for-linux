@@ -1,6 +1,14 @@
 /*
- * 屏幕批注软件 v3 —— 单窗口架构 (Wayland + X11 统一)
+ * Sidera —— 单窗口架构 Linux Sidera工具 (Wayland + X11 统一)
  * Qt 5.12 / CPU 软件渲染
+ *
+ * Copyright (C) 2026 Carl_Jin
+ *
+ * 本程序是自由软件：你可以依据自由软件基金会发布的 GNU 通用公共许可证
+ * (GPL) 第 3 版（或按其约定可使用的任何更新版本）的条款，重新分发和/或
+ * 修改本程序。详见 https://www.gnu.org/licenses/gpl-3.0.html
+ *
+ * Sidera（拉丁语：星星）
  *
  * 架构：
  *   单窗口 MainWidget，两种形态：
@@ -58,6 +66,11 @@
 #include <QUrlQuery>
 #include <QFileInfo>
 #include <QCoreApplication>
+#include <QLocalServer>
+#include <QLocalSocket>
+#include <QProgressBar>
+#include <QElapsedTimer>
+#include <QThread>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -98,6 +111,11 @@ struct AppState {
   int  currentMode = 0;           // 0=光标 1=画笔 2=橡皮擦
   bool penPopupVisible   = false;
   bool eraserPopupVisible = false;
+
+  // 白板模式：透明可穿透画布 ↔ 不透明白板（全屏可输入）
+  bool whiteboard = false;
+  QPushButton* wbBtnL = nullptr;
+  QPushButton* wbBtnR = nullptr;
 
   // 颜色 + 粗细
   QVector<QColor> colors     = { QColor(255,40,40), QColor(50,120,255), QColor(40,200,60), QColor(255,210,30), QColor(240,240,240) };
@@ -160,7 +178,14 @@ struct AppState {
   quint64      wpsLastSeen      = 0;
   QQueue<QString> wpsCmdQueue;               // 待加载项取走的 NEXT/PREV
   int          wpsRealPos       = -1;   // 加载项上报的真实页号（1 起）
+
+  // 手掌自动橡皮（试验，默认开，设置里可关）：多点触控=手掌临时当橡皮
+  bool palmEraseOn = true;
+  QVector<QPoint> palmErasePreview;   // 当前作为“橡皮”的触点位置（画圆形预览用）
 };
+
+// 手掌橡皮直径（“大号”擦除尺寸）
+static const int kPalmEraseWidth = 48;
 
 static AppState g;
 
@@ -178,6 +203,8 @@ static void repositionPopups();
 static void updateSidebarStyles();
 static void setInputShapeToSidebar();
 static void resetInputShape();
+static void toggleWhiteboard();
+static void updateWhiteboardButtonStyles();
 static void sendXTestKey(Display* dpy, KeySym ks);
 static void goToPrevPage();
 static void goToNextPage();
@@ -248,6 +275,34 @@ static QPixmap makeLineIcon(int s) {
 }
 
 // ============================================================
+// 5b. Sidera 图标（PNG，SVG 同图提取）：设置面板 + 启动闪屏展示
+// ============================================================
+static QString sideraIconPath() {
+  // 优先 PNG（程序内不依赖 QtSvg，容器/教室只有 Qt5 基础模块）
+  QStringList cands;
+  QString env = QString::fromLocal8Bit(qgetenv("SIDERA_ICON"));
+  if (!env.isEmpty()) cands << env;
+  cands << QCoreApplication::applicationDirPath() + "/sidera.png";
+  cands << QDir::currentPath() + "/sidera.png";
+  cands << "/usr/share/sidera/sidera.png";
+  cands << "/usr/share/icons/hicolor/256x256/apps/sidera.png";
+  for (const QString& c : cands) if (QFile::exists(c)) return c;
+  return QString();
+}
+
+static QPixmap sideraIconPixmap(int px) {
+  QString p = sideraIconPath();
+  QPixmap pm(px, px);
+  pm.fill(Qt::transparent);
+  if (!p.isEmpty()) {
+    QImage img(p);
+    if (!img.isNull())
+      pm = QPixmap::fromImage(img.scaled(px, px, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+  }
+  return pm;
+}
+
+// ============================================================
 // 6. 侧边栏磨砂背景画笔
 // ============================================================
 class SidebarPainter : public QObject {
@@ -288,24 +343,30 @@ static int sbBtn()    { return int(34 * g.sbScale); }
 static int sbIcon()   { return int(24 * g.sbScale); }
 static int sbDot()    { return int(19 * g.sbScale); }
 // 高度 = 固定 margins/spacing + 8 个按钮（间距 7 个 + 上下边距 18/14）
-static int sbHeight() { return 18 + 14 + 8 * sbBtn() + 7 * 8; }
+static int sbHeight() { return 18 + 14 + 9 * sbBtn() + 8 * 8; }
 
-// 画一段笔迹到 g.canvas（画笔/橡皮擦共用，鼠标和触摸都调用）
-static void strokeToCanvas(QPoint a, QPoint b) {
+// 画/擦一段到 g.canvas（显式指定动作与宽度，触摸/鼠标共用）
+static void strokeSegment(QPoint a, QPoint b, bool erase, int width) {
   if (!g.canvas) return;
   QPainter p(g.canvas);
-  if (g.currentMode == 2) {
+  if (erase) {
     p.setCompositionMode(QPainter::CompositionMode_Clear);
-    QPen ep(Qt::transparent, g.eraserWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    QPen ep(Qt::transparent, width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
     p.setPen(ep);
   } else {
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-    QPen pen(g.penColor(), g.penWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    QPen pen(g.penColor(), width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
     p.setPen(pen);
     p.setRenderHint(QPainter::Antialiasing, true);
   }
   p.drawLine(a, b);
   p.end();
+}
+
+// 画一段笔迹到 g.canvas（画笔/橡皮擦共用，鼠标和触摸都调用）
+static void strokeToCanvas(QPoint a, QPoint b) {
+  if (g.currentMode == 2) strokeSegment(a, b, true, g.eraserWidth());
+  else                    strokeSegment(a, b, false, g.penWidth());
 }
 
 // ============================================================
@@ -538,7 +599,21 @@ public:
     qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(setL);
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(setR);
 
+    // 白板按钮（圆角矩形文字按钮）——左右各一个
+    auto mkWB = [&](bool isRight) {
+      QPushButton* b = new QPushButton(QString::fromUtf8("白板"));
+      b->setFixedSize(sbBtn(), sbBtn());
+      QObject::connect(b, &QPushButton::clicked, []() { toggleWhiteboard(); });
+      if (isRight) g.wbBtnR = b; else g.wbBtnL = b;
+      return b;
+    };
+    QPushButton* wbL = mkWB(false);
+    QPushButton* wbR = mkWB(true);
+    qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(wbL);
+    qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(wbR);
+
     updateSidebarStyles();
+    updateWhiteboardButtonStyles();
   }
 
   // ===== 按钮逻辑 =====
@@ -578,7 +653,7 @@ protected:
   void paintEvent(QPaintEvent*) override {
     QPainter p(this);
     p.setCompositionMode(QPainter::CompositionMode_Source);
-    p.fillRect(rect(), Qt::transparent);
+    p.fillRect(rect(), g.whiteboard ? QColor(255, 255, 255) : Qt::transparent);
 
     // 始终画 Pixmap（光标模式下也可见）
     if (g.canvas) {
@@ -590,6 +665,17 @@ protected:
       p.setPen(pen);
       p.setRenderHint(QPainter::Antialiasing, true);
       p.drawLine(g.lineStart, g.lastPt);
+    }
+    // 手掌自动橡皮：圆形半透明预览（直径=擦除宽度）
+    if (!g.palmErasePreview.isEmpty()) {
+      int ew = (g.currentMode == 2) ? g.eraserWidth() : kPalmEraseWidth;
+      p.setRenderHint(QPainter::Antialiasing, true);
+      for (const QPoint& c : g.palmErasePreview) {
+        QRectF cr(c.x() - ew / 2.0, c.y() - ew / 2.0, ew, ew);
+        p.setBrush(QColor(255, 150, 190, 55));
+        p.setPen(QPen(QColor(255, 255, 255, 190), 2));
+        p.drawEllipse(cr);
+      }
     }
     p.end();
   }
@@ -668,6 +754,9 @@ protected:
       // 光标模式或画布无效 → 不画线，返回 false（Qt 合成鼠标或穿透桌面）
       if (g.currentMode == 0 || !g.canvas) return false;
 
+      // 手掌自动橡皮（试验）：开启时走多点手势引擎；关闭走原逻辑
+      if (g.palmEraseOn) { handlePalmTouch(te); return true; }
+
       switch (ev->type()) {
         case QEvent::TouchBegin: {
           if (g.currentMode == 3) {
@@ -727,6 +816,100 @@ protected:
       delete old;
     }
     repositionPopups();
+  }
+
+  // ---- 手掌自动橡皮（试验）：单点=笔；一旦多点，整体当橡皮（不“边写边擦”） ----
+  QMap<int, QPoint> m_tPrevPos;
+  QMap<int, int>    m_tPrevRole;      // 1=笔, 2=橡皮
+  QVector<QPoint>  m_prevPreview;
+
+  void handlePalmTouch(QTouchEvent* te) {
+    g.isDrawing = false;
+    const QList<QTouchEvent::TouchPoint>& pts = te->touchPoints();
+    QMap<int, QPoint> now;
+    for (const QTouchEvent::TouchPoint& tp : pts)
+      if (tp.state() != Qt::TouchPointReleased) now.insert(tp.id(), tp.pos().toPoint());
+
+    const int mode = g.currentMode;
+    const bool modeEraseOnly = (mode == 2);
+    const int n = now.size();
+    // 角色：仅剩 1 点才可能当笔；≥2 点全部当橡皮（直接切换，无并发画笔）
+    bool anyPen = (!modeEraseOnly && n == 1);
+
+    QMap<int,int> curRoleMap;
+    for (auto it = now.begin(); it != now.end(); ++it) {
+      int id = it.key();
+      QPoint pos = it.value();
+      int curRole = anyPen ? 1 : 2;
+      curRoleMap[id] = curRole;
+
+      int oldRole = m_tPrevRole.value(id, -1);
+      QPoint oldPos = m_tPrevPos.value(id);
+      bool haveOld = m_tPrevPos.contains(id);
+
+      if (curRole != oldRole || !haveOld) {   // 新触点或角色变化：记基准，不连笔/连擦
+        m_tPrevPos[id] = pos;
+        m_tPrevRole[id] = curRole;
+        continue;
+      }
+      if (oldPos == pos) continue;
+
+      if (curRole == 1) {
+        if (mode == 1) {
+          strokeSegment(oldPos, pos, false, g.penWidth());
+          int w = g.penWidth();
+          QRect d(QRect(QPoint(qMin(oldPos.x(),pos.x()), qMin(oldPos.y(),pos.y())),
+                        QPoint(qMax(oldPos.x(),pos.x()), qMax(oldPos.y(),pos.y()))).adjusted(-w,-w,w,w));
+          update(d);
+        } else if (mode == 3) {
+          if (!g.linePreview) { g.lineStart = oldPos; g.linePreview = true; g.lastPt = oldPos; }
+          g.lastPt = pos;
+        }
+      } else {                                 // 橡皮（多点=手掌 / 橡皮模式）
+        int ew = (mode == 2) ? g.eraserWidth() : kPalmEraseWidth;
+        strokeSegment(oldPos, pos, true, ew);
+        QRect d(QRect(QPoint(qMin(oldPos.x(),pos.x()), qMin(oldPos.y(),pos.y())),
+                      QPoint(qMax(oldPos.x(),pos.x()), qMax(oldPos.y(),pos.y()))).adjusted(-ew,-ew,ew,ew));
+        update(d);
+      }
+      m_tPrevPos[id] = pos;
+      m_tPrevRole[id] = curRole;
+    }
+
+    // 进入多点时取消直线预览（整体切橡皮）
+    if (n >= 2) g.linePreview = false;
+
+    // 清理抬起的触点
+    for (auto it = m_tPrevPos.begin(); it != m_tPrevPos.end();) {
+      if (!now.contains(it.key())) it = m_tPrevPos.erase(it); else ++it;
+    }
+    for (auto it = m_tPrevRole.begin(); it != m_tPrevRole.end();) {
+      if (!now.contains(it.key())) it = m_tPrevRole.erase(it); else ++it;
+    }
+
+    // 圆形橡皮预览
+    QVector<QPoint> prev = m_prevPreview;
+    g.palmErasePreview.clear();
+    for (auto it = now.begin(); it != now.end(); ++it)
+      if (curRoleMap.value(it.key(), 2) == 2) g.palmErasePreview << it.value();
+    QVector<QPoint> all = prev; for (const QPoint& q : g.palmErasePreview) all << q;
+    if (!all.isEmpty()) {
+      int pad = (mode == 2 ? g.eraserWidth() : kPalmEraseWidth) / 2 + 4;
+      QRect u(all.first(), all.first());
+      for (const QPoint& q : all) u = u.united(QRect(q, q));
+      update(u.adjusted(-pad, -pad, pad, pad));
+    }
+    m_prevPreview = g.palmErasePreview;
+
+    if (now.isEmpty()) {
+      g.palmErasePreview.clear();
+      if (mode == 3 && g.linePreview) {          // 结束直线
+        g.linePreview = false;
+        strokeSegment(g.lineStart, g.lastPt, false, g.penWidth());
+      }
+      m_prevPreview.clear();
+      update();
+    }
   }
 };
 
@@ -949,6 +1132,7 @@ static void clearCanvas() {
  */
 static void setInputShapeToSidebar() {
   if (!g.mainWidget || !g.mainWidget->isVisible()) return;
+  if (g.whiteboard) return;            // 白板模式：全屏可输入，不做侧边栏穿透限制
   Display* dpy = g.xDisplay;
   bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
   if (!dpy) return;
@@ -1011,6 +1195,35 @@ static void resetInputShape() {
   XShapeCombineMask(dpy, g.mainWidget->winId(), ShapeInput, 0, 0, None, ShapeSet);
   XFlush(dpy);
   if (nc) XCloseDisplay(dpy);
+}
+
+// ============================================================
+// 白板模式：整窗不透明（白底）且全屏可输入；再点还原透明可穿透
+// ============================================================
+static void updateWhiteboardButtonStyles() {
+  auto paint = [](QPushButton* b) {
+    if (!b) return;
+    if (g.whiteboard)
+      b->setStyleSheet(QString("QPushButton{background:#f4f4f4;color:#111;border:2px solid #ff9800;border-radius:%1px;font-weight:bold;font-size:%2px;}"
+                       "QPushButton:hover{background:#ffffff;}").arg(int(sbBtn()*0.35)).arg(sbBtn()*16/38));
+    else
+      b->setStyleSheet(QString("QPushButton{background:#555;color:#eee;border:2px solid #999;border-radius:%1px;font-size:%2px;}"
+                       "QPushButton:hover{background:#777;}").arg(int(sbBtn()*0.35)).arg(sbBtn()*16/38));
+  };
+  paint(g.wbBtnL);
+  paint(g.wbBtnR);
+}
+
+static void toggleWhiteboard() {
+  g.whiteboard = !g.whiteboard;
+  updateWhiteboardButtonStyles();
+  if (g.mainWidget) {
+    if (g.whiteboard) resetInputShape();          // 全屏可输入
+    else if (g.currentMode == 0) setInputShapeToSidebar();
+    else resetInputShape();
+    g.mainWidget->update();                       // 触发白底/透明重绘
+  }
+  qDebug() << (g.whiteboard ? "[INFO] 白板模式开启" : "[INFO] 白板模式关闭");
 }
 
 /*
@@ -1099,7 +1312,10 @@ static QString wpsLogFile() {
 static void wpsLog(const QString& msg) {
   QString line = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz ") + msg;
   qDebug().noquote() << "[WPSAPI]" << msg;
-  QFile f(wpsLogFile());
+  QString path = wpsLogFile();
+  // 超过 1MB 自动重开，防日志无限增长
+  if (QFileInfo(path).size() > 1024 * 1024) QFile::remove(path);
+  QFile f(path);
   if (f.open(QIODevice::Append | QIODevice::Text)) {
     QTextStream ts(&f);
     ts << line << "\n";
@@ -1107,33 +1323,43 @@ static void wpsLog(const QString& msg) {
   }
 }
 
-// ---------------- 调试开关持久化 ----------------
+// ---------------- 设置持久化（wpsDebug / 侧边栏透明度 / 大小） ----------------
 static QString wpsConfigFile() {
-  return QDir::homePath() + "/.config/screen-annotate/config";
+  return QDir::homePath() + "/.config/sidera/config";
 }
 static bool wpsConfigExists() { return QFile::exists(wpsConfigFile()); }
-// 返回 -1 表示无配置
-static int wpsLoadDebugSetting() {
-  QFile f(wpsConfigFile());
-  if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return -1;
-  QString s = QString::fromUtf8(f.readAll()).trimmed();
-  f.close();
-  return s == "wpsDebug=1" ? 1 : (s == "wpsDebug=0" ? 0 : -1);
-}
-static void wpsSaveDebugSetting(bool on) {
+static void wpsSaveSettings() {
   QDir().mkpath(QFileInfo(wpsConfigFile()).absolutePath());
   QFile f(wpsConfigFile());
-  if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-    QTextStream ts(&f);
-    ts << "wpsDebug=" << (on ? 1 : 0) << "\n";
-    f.close();
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) return;
+  QTextStream ts(&f);
+  ts << "wpsDebug=" << (g.wpsDebug ? 1 : 0) << "\n";
+  ts << "sbScale=" << QString::number(g.sbScale, 'f', 2) << "\n";
+  ts << "sidebarAlpha=" << g.sidebarAlpha << "\n";
+  ts << "palmErase=" << (g.palmEraseOn ? 1 : 0) << "\n";
+  f.close();
+}
+static void wpsLoadSettings() {
+  QFile f(wpsConfigFile());
+  if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+  while (!f.atEnd()) {
+    QString line = QString::fromUtf8(f.readLine()).trimmed();
+    int eq = line.indexOf('=');
+    if (eq < 0) continue;
+    QString k = line.left(eq);
+    QString v = line.mid(eq + 1);
+    if (k == "wpsDebug") g.wpsDebug = (v == "1");
+    else if (k == "sbScale") g.sbScale = qBound(0.6, v.toDouble(), 1.4);
+    else if (k == "sidebarAlpha") g.sidebarAlpha = qBound(30, v.toInt(), 255);
+    else if (k == "palmErase") g.palmEraseOn = (v == "1");
   }
+  f.close();
 }
 
 // ---------------- 加载项自动注册（写当前用户 jsaddons/publish.xml） ----------------
 static void ensureWpsAddinRegistered() {
   QString path = QDir::homePath() + "/.local/share/Kingsoft/wps/jsaddons/publish.xml";
-  QString entry = "  <jspluginonline name=\"screen-annotate-bridge\" type=\"wpp\" "
+  QString entry = "  <jspluginonline name=\"sidera-bridge\" type=\"wpp\" "
                   "url=\"http://127.0.0.1:16666/\" debug=\"\" enable=\"enable\" install=\"null\"/>\n";
   QDir().mkpath(QFileInfo(path).absolutePath());
   QFile f(path);
@@ -1142,7 +1368,7 @@ static void ensureWpsAddinRegistered() {
     content = QString::fromUtf8(f.readAll());
     f.close();
   }
-  if (content.contains("screen-annotate-bridge")) return;   // 已登记，静默
+  if (content.contains("sidera-bridge") || content.contains("screen-annotate-bridge")) return;   // 已登记，静默
   if (!content.isEmpty() && content.contains("<jsplugins>") && content.contains("</jsplugins>"))
     content.replace("</jsplugins>", entry + "</jsplugins>");
   else
@@ -1259,7 +1485,7 @@ static void setWpsDebug(bool on, bool persist = true) {
   if (g.wpsDebug == on) {                     // 状态没变
     if (on && !g.wpsServer) startWpsApiServer();
     if (on && g.wpsServer) ensureWpsAddinRegistered();
-    if (persist) wpsSaveDebugSetting(on);
+    if (persist) wpsSaveSettings();
     return;
   }
   g.wpsDebug = on;
@@ -1270,7 +1496,7 @@ static void setWpsDebug(bool on, bool persist = true) {
     stopWpsApiServer();
     g.wpsRealPos = -1;
   }
-  if (persist) wpsSaveDebugSetting(on);
+  if (persist) wpsSaveSettings();
 }
 
 // ============================================================
@@ -1313,7 +1539,7 @@ static void wpsHandleHttp(QTcpSocket* s) {
   if (method == "OPTIONS") { wpsHttpReply(s, ""); return; }
   if (path == "/hello") {
     wpsLog("加载项问候: " + m);
-    wpsHttpReply(s, "OK screen-annotate");
+    wpsHttpReply(s, "OK sidera");
     return;
   }
   if (path == "/push" && !m.isEmpty()) {
@@ -1336,7 +1562,7 @@ static QString wpsAddinDir() {
   if (!env.isEmpty() && QFile::exists(env + "/manifest.xml")) return env;
   QString app = QCoreApplication::applicationDirPath() + "/wps-addin";
   if (QFile::exists(app + "/manifest.xml")) return app;
-  QString sys = "/usr/share/screen-annotate/wps-addin";
+  QString sys = "/usr/share/sidera/wps-addin";
   if (QFile::exists(sys + "/manifest.xml")) return sys;
   return QString();
 }
@@ -1585,6 +1811,7 @@ static void rebuildSidebars() {
   g.cursorBtn = g.penBtn = g.eraserBtn = g.lineBtn = nullptr;
   g.cursorBtnR = g.penBtnR = g.eraserBtnR = g.lineBtnR = nullptr;
   g.prevBtn = g.nextBtn = nullptr;
+  g.wbBtnL = g.wbBtnR = nullptr;
   // 重建
   mw->buildSidebar();
   // 恢复贴边位置（Y 保留原值，约束在新高度内）
@@ -1601,7 +1828,7 @@ static void rebuildSidebars() {
 static QString autoStartPath() {
   QString dir = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation) + "/autostart";
   QDir().mkpath(dir);
-  return dir + "/screen-annotate.desktop";
+  return dir + "/sidera.desktop";
 }
 static bool isAutoStart() {
   return QFile::exists(autoStartPath());
@@ -1614,9 +1841,9 @@ static void setAutoStart(bool on) {
       QTextStream ts(&f);
       ts << "[Desktop Entry]\n"
          << "Type=Application\n"
-         << "Name=屏幕批注\n"
-         << "Comment=屏幕批注软件\n"
-         << "Exec=screen-annotate\n"
+         << "Name=Sidera\n"
+         << "Comment=Sidera软件\n"
+         << "Exec=sidera\n"
          << "Terminal=false\n";
       f.close();
     }
@@ -1656,7 +1883,7 @@ static void openSettings() {
   // 关闭即销毁：标题栏 X 也会触发 destroyed，从而执行恢复画布的回调
   win->setAttribute(Qt::WA_DeleteOnClose, true);
   win->setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint);
-  win->setWindowTitle(QString::fromUtf8("屏幕批注 - 设置"));
+  win->setWindowTitle(QString::fromUtf8("Sidera - 设置"));
   win->setFixedWidth(300);
   win->setStyleSheet(
     "QWidget{background:#2b2b33;color:#eee;font-size:14px;}"
@@ -1672,6 +1899,14 @@ static void openSettings() {
   lay->setContentsMargins(16, 16, 16, 12);
   lay->setSpacing(10);
 
+  // 顶部居中：Sidera 图标
+  {
+    QLabel* iconLbl = new QLabel();
+    iconLbl->setPixmap(sideraIconPixmap(56));
+    iconLbl->setAlignment(Qt::AlignCenter);
+    lay->addWidget(iconLbl);
+  }
+
   // 透明度
   lay->addWidget(new QLabel(QString::fromUtf8("侧边栏透明度")));
   QSlider* alphaSlider = new QSlider(Qt::Horizontal);
@@ -1684,6 +1919,7 @@ static void openSettings() {
     // 触发两侧边栏重绘（背景由 SidebarPainter 用 g.sidebarAlpha 画）
     if (g.sidebarArea) g.sidebarArea->update();
     if (g.sidebarAreaRight) g.sidebarAreaRight->update();
+    wpsSaveSettings();
   });
   lay->addLayout(makeSliderRow(alphaSlider, alphaVal));
 
@@ -1697,6 +1933,7 @@ static void openSettings() {
     g.sbScale = v / 100.0;
     sizeVal->setText(QString::number(g.sbScale, 'f', 1));
     rebuildSidebars();
+    wpsSaveSettings();
   });
   lay->addLayout(makeSliderRow(sizeSlider, sizeVal));
 
@@ -1749,6 +1986,44 @@ static void openSettings() {
   });
   lay->addWidget(wpsBtn);
   lay->addWidget(wpsHint);
+
+  // 手掌自动橡皮（试验，默认开）
+  QPushButton* palmBtn = new QPushButton();
+  auto updatePalmBtn = [palmBtn]() {
+    bool on = g.palmEraseOn;
+    palmBtn->setText(on ? QString::fromUtf8("手掌自动橡皮(试验): 开") : QString::fromUtf8("手掌自动橡皮(试验): 关"));
+    palmBtn->setStyleSheet(on ? "QPushButton{background:#4a3f6a;color:#fff;border:1px solid #8a6adf;border-radius:6px;padding:8px;}"
+                              : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
+  };
+  updatePalmBtn();
+  QObject::connect(palmBtn, &QPushButton::clicked, [palmBtn, updatePalmBtn]() {
+    g.palmEraseOn = !g.palmEraseOn;
+    g.palmErasePreview.clear();
+    wpsSaveSettings();
+    updatePalmBtn();
+  });
+  lay->addWidget(palmBtn);
+  QLabel* palmHint = new QLabel(QString::fromUtf8("画笔/直线模式下手掌(多点)临时当大号橡皮，单点恢复笔；橡皮/光标模式不受影响。"));
+  palmHint->setWordWrap(true);
+  palmHint->setStyleSheet("color:#667;font-size:11px;");
+  lay->addWidget(palmHint);
+
+  // 清空调试日志（防止不熟悉的人让日志越积越多）
+  QPushButton* clearLogBtn = new QPushButton(QString::fromUtf8("清空调试日志"));
+  clearLogBtn->setStyleSheet("QPushButton{background:#444;color:#ccc;padding:8px;border-radius:6px;font-size:13px;}"
+                             "QPushButton:hover{background:#555;}");
+  QObject::connect(clearLogBtn, &QPushButton::clicked, [clearLogBtn]() {
+    QFile::remove(wpsLogFile());
+    clearLogBtn->setText(QString::fromUtf8("已清空 ✓"));
+    QTimer::singleShot(1200, [clearLogBtn]() { clearLogBtn->setText(QString::fromUtf8("清空调试日志")); });
+  });
+  lay->addWidget(clearLogBtn);
+
+  // 版权信息
+  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.3-Geo   © 2026 Carl_Jin\nGNU GPL v3"));
+  creditLbl->setAlignment(Qt::AlignCenter);
+  creditLbl->setStyleSheet("color:#556;font-size:11px;");
+  lay->addWidget(creditLbl);
 
   lay->addSpacing(6);
 
@@ -1850,6 +2125,96 @@ static void showSystemInfo() {
 }
 
 // ============================================================
+// 启动闪屏：屏幕中央小窗、青→粉渐变、底部进度条、右下角 byline
+// ============================================================
+class SplashWindow : public QWidget {
+public:
+  explicit SplashWindow() {
+    setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+    setAttribute(Qt::WA_TranslucentBackground);
+    setFixedSize(460, 210);
+    bar = new QProgressBar(this);
+    bar->setRange(0, 100);
+    bar->setValue(0);
+    bar->setFixedHeight(10);
+    bar->setTextVisible(false);
+    bar->setStyleSheet(
+      "QProgressBar{background:rgba(255,255,255,45);border:none;border-radius:5px;}"
+      "QProgressBar::chunk{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+      "stop:0 #00e5ff,stop:1 #ff80ab);border-radius:5px;}");
+  }
+  void setProgress(int v) { bar->setValue(v); }
+
+protected:
+  void paintEvent(QPaintEvent*) override {
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    QRectF r = rect().adjusted(1.5, 1.5, -1.5, -1.5);
+    QLinearGradient g(r.topLeft(), r.bottomRight());
+    g.setColorAt(0.0, QColor(0, 200, 255, 245));    // cyan
+    g.setColorAt(1.0, QColor(255, 120, 180, 245));  // pink
+    p.setBrush(g);
+    p.setPen(QPen(QColor(255, 255, 255, 70), 1.5));
+    p.drawRoundedRect(r, 20, 20);
+
+    // 图标（顶部居中）
+    static const QPixmap ico = sideraIconPixmap(84);
+    if (!ico.isNull()) {
+      int ix = (width() - ico.width()) / 2;
+      p.drawPixmap(ix, 22, ico);
+    }
+
+    // 名字
+    QFont nf = p.font();
+    nf.setPointSize(38);
+    nf.setBold(true);
+    p.setFont(nf);
+    p.setPen(Qt::white);
+    p.drawText(QRect(0, 108, width(), 54),
+               Qt::AlignCenter, QStringLiteral("Sidera"));
+
+    // 右下角 byline
+    QFont bf = p.font();
+    bf.setPointSize(10);
+    bf.setBold(false);
+    p.setFont(bf);
+    p.setPen(QColor(255, 255, 255, 210));
+    p.drawText(QRect(0, int(height() * 0.74), width() - 22, 24),
+               Qt::AlignRight | Qt::AlignVCenter,
+               QStringLiteral("developed by jinyicheng"));
+    p.end();
+  }
+
+  void resizeEvent(QResizeEvent*) override {
+    if (bar) bar->setGeometry(24, height() - 30, width() - 48, 10);
+  }
+
+private:
+  QProgressBar* bar = nullptr;
+};
+
+// 阻塞显示 2 秒启动闪屏（进度条 0→100），随后主程序继续初始化
+static void showSplashFor(QApplication& app) {
+  SplashWindow splash;
+  QRect scr = QGuiApplication::primaryScreen()->geometry();
+  splash.move(scr.center() - splash.rect().center());
+  splash.show();
+  splash.setProgress(0);
+  QElapsedTimer t;
+  t.start();
+  const int dur = 2000;
+  while (t.elapsed() < dur) {
+    int p = qMin(100, int(t.elapsed() * 100 / dur));
+    splash.setProgress(p);
+    app.processEvents();
+    QThread::msleep(16);
+  }
+  splash.setProgress(100);
+  app.processEvents();
+  splash.close();
+}
+
+// ============================================================
 // 13. main
 // ============================================================
 int main(int argc, char* argv[]) {
@@ -1858,6 +2223,39 @@ int main(int argc, char* argv[]) {
 
   g.platform = detectPlatform();
   qDebug() << "[INFO] 平台:" << g.platform;
+
+  // 单实例：先探测是否已有实例；有则唤醒其窗口并退出，无则清理残留后监听
+  {
+    const QString name = "sidera-single";
+    QLocalSocket probe;
+    probe.connectToServer(name);
+    if (probe.waitForConnected(300)) {
+      probe.write("show"); probe.flush(); probe.waitForBytesWritten(200);
+      qWarning() << "[WARN] Sidera已在运行，退出新实例";
+      return 0;
+    }
+    QLocalServer::removeServer(name);           // 仅清理上次崩溃的残留，不会误删运行中的实例
+    QLocalServer* single = new QLocalServer(&app);
+    if (!single->listen(name)) {               // 极端竞态：探测后又有人抢先
+      QLocalSocket ping;
+      ping.connectToServer(name);
+      if (ping.waitForConnected(300)) { ping.write("show"); ping.flush(); }
+      qWarning() << "[WARN] Sidera已在运行，退出新实例";
+      return 0;
+    }
+    QObject::connect(single, &QLocalServer::newConnection, [single]() {
+      QLocalSocket* c = single->nextPendingConnection();
+      if (c) c->deleteLater();
+      if (g.mainWidget) { g.mainWidget->show(); g.mainWidget->raise(); g.mainWidget->activateWindow(); }
+      if (g.settingsWin) { g.settingsWin->show(); g.settingsWin->raise(); g.settingsWin->activateWindow(); }
+    });
+  }
+
+  // 启动闪屏：延后 2 秒主界面初始化，期间显示进度动画
+  showSplashFor(app);
+
+  // 载入持久化设置（透明度/大小/wpsDebug），须在构建侧边栏前
+  wpsLoadSettings();
 
   // 单窗口
   MainWidget* mw = new MainWidget();
@@ -1900,17 +2298,11 @@ int main(int argc, char* argv[]) {
     delete g.iconLine; g.iconLine = nullptr;
   });
 
-  // 调试模式启动策略：环境变量 WPS_API_DEBUG > 配置文件 > 默认开(教室)
+  // 调试模式启动：已由 wpsLoadSettings 载入 g.wpsDebug；环境变量仅本次运行覆盖（不落盘）
   {
-    bool want = true;                          // 默认开
     QString env = QString::fromLocal8Bit(qgetenv("WPS_API_DEBUG"));
-    if (!env.isEmpty()) { want = (env == "1"); }
-    else {
-      int saved = wpsLoadDebugSetting();
-      if (saved >= 0) want = (saved == 1);
-    }
-    // 无配置文件且默认开时不落盘；有配置才持久化
-    setWpsDebug(want, wpsConfigExists());
+    if (!env.isEmpty()) setWpsDebug(env == "1", false);
+    else                setWpsDebug(g.wpsDebug, false);
   }
 
   return app.exec();

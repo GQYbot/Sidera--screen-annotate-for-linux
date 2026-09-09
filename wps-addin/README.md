@@ -1,4 +1,4 @@
-# 屏幕批注 - WPS 加载项部署包
+# Sidera - WPS 加载项部署包
 
 作用：让 WPS 演示(放映)期间，把“真实页号变化”回传给批注 app，
 使得批注缓存只在**真换页**时切换；页内动画步不动批注。
@@ -6,11 +6,11 @@ app 侧需开启 `设置 → WPS 接口调试模式`（内容由此服务的 127
 
 ## 部署（每台机器一次，按当前用户）
 ```bash
-./install.sh            # 或安装 deb 后用: screen-annotate-wps-addin-install
+./install.sh            # 或安装 deb 后用: sidera-wps-addin-install
 ```
 
 ## 使用顺序
-1. 启动屏幕批注 app，并在设置里开启“WPS 接口调试”（或 WPS_API_DEBUG=1 启动）。
+1. 启动Sidera app，并在设置里开启“WPS 接口调试”（或 WPS_API_DEBUG=1 启动）。
 2. 再打开 WPS 演示 → 工具栏出现“批注联动”标签即加载成功（可点“状态”确认）。
 3. F5 放映：点批注侧边栏 ▼/▲ 推进，观察批注是否只在真实换页时切换。
 

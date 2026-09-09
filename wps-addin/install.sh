@@ -5,10 +5,10 @@ set -e
 DST="${HOME}/.local/share/Kingsoft/wps/jsaddons"
 SRC="$(dirname "$(readlink -f "$0")")/publish.xml"
 if [ ! -f "$SRC" ]; then
-  SRC="/usr/share/screen-annotate/wps-addin/publish.xml"
+  SRC="/usr/share/sidera/wps-addin/publish.xml"
 fi
 mkdir -p "$DST"
 cp -f "$SRC" "$DST/publish.xml"
 echo "已写入: $DST/publish.xml"
-echo "提示：请先启动“屏幕批注”并开启 设置→WPS接口调试，再重新打开 WPS 演示。"
+echo "提示：请先启动“Sidera”并开启 设置→WPS接口调试，再重新打开 WPS 演示。"
 echo "      放映时加载项会把真实页号回传，批注缓存随真实换页切换。"
