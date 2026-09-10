@@ -1,8 +1,8 @@
-# Sidera 教室部署说明（2.3-Geo）
+# Sidera 教室部署说明（2.4-Geo）
 
 ## 装（管理员）
 ```bash
-sudo dpkg -i sidera_2.3-Geo_arm64.deb    # arm64 教室机
+sudo dpkg -i sidera_2.4-Geo_arm64.deb    # arm64 教室机
 # x86 机器用 _amd64.deb
 ```
 

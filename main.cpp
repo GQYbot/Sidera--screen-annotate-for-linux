@@ -71,6 +71,9 @@
 #include <QProgressBar>
 #include <QElapsedTimer>
 #include <QThread>
+#include <QMessageBox>
+#include <QMenu>
+#include <QClipboard>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -118,7 +121,8 @@ struct AppState {
   QPushButton* wbBtnR = nullptr;
 
   // 颜色 + 粗细
-  QVector<QColor> colors     = { QColor(255,40,40), QColor(50,120,255), QColor(40,200,60), QColor(255,210,30), QColor(240,240,240) };
+  QVector<QColor> colors     = { QColor(255,40,40), QColor(50,120,255), QColor(40,200,60), QColor(255,210,30), QColor(240,240,240),
+                                 QColor("#4DD0E1"), QColor("#AB47BC"), QColor("#C9DD22") };
   QVector<int> penSizes      = { 3, 6, 10 };
   QVector<int> eraserSizes   = { 12, 24, 48 };
   int curColor   = 0;
@@ -165,7 +169,8 @@ struct AppState {
   QPushButton* nextBtn = nullptr;
 
   // 多页缓存
-  QMap<int, QPixmap*> slideCache;  // 页码 → 笔迹
+  QMap<int, QPixmap*> slideCache;  // 页码 → 笔迹（普通/放映模式）
+  QMap<int, QPixmap*> whiteboardCache; // 页码 → 笔迹（白板模式，与上面独立）
   int currentSlide  = 1;           // 当前页码
   int maxCachePages = 2;           // 非全屏 2 页，全屏 30 页
 
@@ -189,6 +194,11 @@ static const int kPalmEraseWidth = 48;
 
 static AppState g;
 
+// 当前生效的笔迹缓存：白板模式与普通/放映模式各自独立
+static QMap<int, QPixmap*>& activeCache() {
+  return g.whiteboard ? g.whiteboardCache : g.slideCache;
+}
+
 // ============================================================
 // 2. 前向声明
 // ============================================================
@@ -205,10 +215,15 @@ static void setInputShapeToSidebar();
 static void resetInputShape();
 static void toggleWhiteboard();
 static void updateWhiteboardButtonStyles();
+static void exitPresentation();
+static void showMoreMenu(QPushButton* b);
+static void doScreenshot();
 static void sendXTestKey(Display* dpy, KeySym ks);
 static void goToPrevPage();
 static void goToNextPage();
 static void clearAllPages();
+static void saveCurrentPage();
+static void loadPage(int page);
 static QWidget* createPopup(int w, int h);
 static void openSettings();
 static void closeSettings();
@@ -343,7 +358,8 @@ static int sbBtn()    { return int(34 * g.sbScale); }
 static int sbIcon()   { return int(24 * g.sbScale); }
 static int sbDot()    { return int(19 * g.sbScale); }
 // 高度 = 固定 margins/spacing + 8 个按钮（间距 7 个 + 上下边距 18/14）
-static int sbHeight() { return 18 + 14 + 9 * sbBtn() + 8 * 8; }
+// 高度 = 固定 margins + 8 个普通按钮 + 1 个高退出键(3×) + 8 个间距
+static int sbHeight() { return 18 + 14 + 11 * sbBtn() + 8 * 8; }
 
 // 画/擦一段到 g.canvas（显式指定动作与宽度，触摸/鼠标共用）
 static void strokeSegment(QPoint a, QPoint b, bool erase, int width) {
@@ -504,9 +520,13 @@ public:
     QObject::connect(eraserB, &QPushButton::clicked, [this, isRight]() { g.popupOnRight = isRight; MainWidget::onEraserClicked(); });
     lay->addWidget(eraserB);
 
-    QPushButton* lineB = mk(*g.iconLine);
-    QObject::connect(lineB, &QPushButton::clicked, [this, isRight]() { g.popupOnRight = isRight; MainWidget::onLineClicked(); });
-    lay->addWidget(lineB);
+    // 更多功能（省略号）——打开子菜单（截图等）
+    QPushButton* moreB = new QPushButton(QString::fromUtf8("\342\213\257"));   // ⋯
+    moreB->setFixedSize(sbBtn(), sbBtn());
+    moreB->setStyleSheet(QString("QPushButton{background:transparent;border:2px solid transparent;border-radius:%1px;font-size:%2px;font-weight:bold;color:#ddd;}"
+                         "QPushButton:hover{background:rgba(255,255,255,0.1);}").arg(sbBtn()/2).arg(sbBtn()*16/38));
+    QObject::connect(moreB, &QPushButton::clicked, [moreB]() { showMoreMenu(moreB); });
+    lay->addWidget(moreB);
 
     sb->installEventFilter(new SidebarDragFilter(sb, isRight));
 
@@ -514,13 +534,11 @@ public:
       g.cursorBtnR = cursorB;
       g.penBtnR = penB;
       g.eraserBtnR = eraserB;
-      g.lineBtnR = lineB;
       g.sidebarAreaRight = sb;
     } else {
       g.cursorBtn = cursorB;
       g.penBtn = penB;
       g.eraserBtn = eraserB;
-      g.lineBtn = lineB;
       g.sidebarArea = sb;
     }
 
@@ -564,25 +582,22 @@ public:
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(prevB);
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(nextB);
 
-    // 退出全屏按钮（⛶）——发送 ESC 键让焦点窗口退出全屏，左右各一个
-    auto mkFexit = []() {
-      QPushButton* b = new QPushButton(QString::fromUtf8("\342\233\266"));
-      b->setFixedSize(sbBtn(), sbBtn());
-      b->setStyleSheet(QString("QPushButton{background:#3a4a3a;color:#aaffaa;border:1.5px solid #66aa66;border-radius:%1px;font-size:%2px;font-weight:bold;}"
-                       "QPushButton:hover{background:#446644;color:#ffffff;}").arg(sbBtn()/2).arg(sbBtn()*12/19));
+    // 退出放映按钮：长胶囊 + 竖排“退出放映”，醒目色；点击先回光标模式再发 ESC
+    auto mkBigExit = []() {
+      QPushButton* b = new QPushButton(QString::fromUtf8("退\n出\n放\n映"));
+      b->setFixedSize(sbBtn(), sbBtn() * 3);
+      b->setStyleSheet(QString(
+        "QPushButton{background:#d33a3a;color:#ffffff;border:2px solid #ff8080;"
+        "border-radius:%1px;font-weight:bold;font-size:%2px;}"
+        "QPushButton:hover{background:#ff4d4d;}").arg(sbBtn()/2).arg(sbBtn()*11/34));
       return b;
     };
-    auto sendEsc = []() {
-      Display* dpy = g.xDisplay;
-      bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
-      if (dpy) { sendXTestKey(dpy, XK_Escape); if (nc) XCloseDisplay(dpy); }
-    };
-    QPushButton* fexitL = mkFexit();
-    QPushButton* fexitR = mkFexit();
-    QObject::connect(fexitL, &QPushButton::clicked, sendEsc);
-    QObject::connect(fexitR, &QPushButton::clicked, sendEsc);
-    qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(fexitL);
-    qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(fexitR);
+    QPushButton* exitL = mkBigExit();
+    QPushButton* exitR = mkBigExit();
+    QObject::connect(exitL, &QPushButton::clicked, []() { exitPresentation(); });
+    QObject::connect(exitR, &QPushButton::clicked, []() { exitPresentation(); });
+    qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(exitL);
+    qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(exitR);
 
     // 设置按钮（⚙）——打开独立设置窗口，左右各一个
     auto mkSet = []() {
@@ -691,6 +706,7 @@ protected:
     }
     if (g.currentMode == 0 || !g.canvas) return;
     if (ev->button() == Qt::LeftButton) {
+      closeAllPopups();          // 开始绘画/擦除时自动关闭画笔/橡皮子菜单
       g.isDrawing = true;
       g.lastPt   = ev->pos();
     }
@@ -759,6 +775,7 @@ protected:
 
       switch (ev->type()) {
         case QEvent::TouchBegin: {
+          closeAllPopups();          // 开始触摸即关闭画笔/橡皮子菜单
           if (g.currentMode == 3) {
             g.lineStart = cur;
             g.linePreview = true;
@@ -825,6 +842,7 @@ protected:
 
   void handlePalmTouch(QTouchEvent* te) {
     g.isDrawing = false;
+    if (te->type() == QEvent::TouchBegin) closeAllPopups();  // 开始触摸即关闭画笔/橡皮子菜单
     const QList<QTouchEvent::TouchPoint>& pts = te->touchPoints();
     QMap<int, QPoint> now;
     for (const QTouchEvent::TouchPoint& tp : pts)
@@ -933,7 +951,7 @@ static QWidget* createPopup(int w, int h) {
 
 static void showPenPopup() {
   if (g.penPopup) { g.penPopup->deleteLater(); g.penPopup = nullptr; }
-  QWidget* pop = createPopup(220, 170);
+  QWidget* pop = createPopup(340, 170);
   g.penPopup = pop;
   QVBoxLayout* lay = new QVBoxLayout(pop);
   lay->setContentsMargins(12,10,12,10); lay->setSpacing(8);
@@ -1096,11 +1114,9 @@ static void updateSidebarStyles() {
   if (g.cursorBtn) g.cursorBtn->setStyleSheet(style(0));
   if (g.penBtn)    g.penBtn->setStyleSheet(style(1));
   if (g.eraserBtn) g.eraserBtn->setStyleSheet(style(2));
-  if (g.lineBtn)   g.lineBtn->setStyleSheet(style(3));
   if (g.cursorBtnR) g.cursorBtnR->setStyleSheet(style(0));
   if (g.penBtnR)    g.penBtnR->setStyleSheet(style(1));
   if (g.eraserBtnR) g.eraserBtnR->setStyleSheet(style(2));
-  if (g.lineBtnR)   g.lineBtnR->setStyleSheet(style(3));
 }
 
 // ============================================================
@@ -1215,7 +1231,11 @@ static void updateWhiteboardButtonStyles() {
 }
 
 static void toggleWhiteboard() {
+  // 把当前笔迹存进“当前模式”的缓存，再切换模式并载入另一套缓存
+  saveCurrentPage();
   g.whiteboard = !g.whiteboard;
+  if (g.canvas) g.canvas->fill(Qt::transparent);   // 清空画布
+  loadPage(g.currentSlide);                        // 载入新模式缓存（无则空白）
   updateWhiteboardButtonStyles();
   if (g.mainWidget) {
     if (g.whiteboard) resetInputShape();          // 全屏可输入
@@ -1224,6 +1244,44 @@ static void toggleWhiteboard() {
     g.mainWidget->update();                       // 触发白底/透明重绘
   }
   qDebug() << (g.whiteboard ? "[INFO] 白板模式开启" : "[INFO] 白板模式关闭");
+}
+
+// 退出放映：先关白板、切回光标模式（让 PPT 自带控件可用），再发 ESC
+static void exitPresentation() {
+  if (g.whiteboard) toggleWhiteboard();
+  if (g.currentMode != 0) switchToCursorMode();
+  Display* dpy = g.xDisplay;
+  bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
+  if (dpy) { sendXTestKey(dpy, XK_Escape); if (nc) XCloseDisplay(dpy); }
+  qDebug() << "[INFO] 退出放映（已回光标模式并发送 ESC）";
+}
+
+// 截图：抓当前主屏 → 存 PNG（图片目录）+ 复制到剪贴板
+static void doScreenshot() {
+  QScreen* sc = QGuiApplication::primaryScreen();
+  if (!sc) { qWarning() << "[WARN] 截图失败：无屏幕"; return; }
+  QPixmap pm = sc->grabWindow(0);
+  if (pm.isNull()) { qWarning() << "[WARN] 截图失败：抓取为空"; return; }
+  QString dir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+  if (dir.isEmpty()) dir = QDir::homePath();
+  QDir().mkpath(dir);
+  QString fn = dir + "/sidera_" + QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss") + ".png";
+  if (pm.save(fn, "PNG")) {
+    qDebug() << "[INFO] 截图已保存:" << fn;
+    QGuiApplication::clipboard()->setImage(pm.toImage());
+  } else {
+    qWarning() << "[WARN] 截图保存失败:" << fn;
+  }
+}
+
+// 更多功能子菜单（省略号按钮）——先放“截图”，后续可扩展
+static void showMoreMenu(QPushButton* b) {
+  if (!b) return;
+  QMenu m;
+  QAction* shot = m.addAction(QString::fromUtf8("截图"));
+  m.setStyleSheet("QMenu{background:#2b2b33;color:#eee;} QMenu::item{padding:8px 24px;} QMenu::item:selected{background:#444;}");
+  QAction* chosen = m.exec(b->mapToGlobal(QPoint(0, b->height())));
+  if (chosen == shot) doScreenshot();
 }
 
 /*
@@ -1254,9 +1312,12 @@ static bool hasCompositor() {
 // 多页缓存：翻页时保存/加载笔迹
 // ============================================================
 static void clearAllPages() {
-  qDebug() << "[INFO] clearAllPages 被调用，清空" << g.slideCache.size() << "页缓存 + 画布";
+  qDebug() << "[INFO] clearAllPages 被调用，清空 普通" << g.slideCache.size()
+           << "+ 白板" << g.whiteboardCache.size() << "页缓存 + 画布";
   for (auto* pix : g.slideCache) delete pix;
   g.slideCache.clear();
+  for (auto* pix : g.whiteboardCache) delete pix;
+  g.whiteboardCache.clear();
   g.currentSlide = 1;
 
   // 重置绘图状态，防止残留（幽灵线 / 未完成的笔画）
@@ -1274,17 +1335,18 @@ static void clearAllPages() {
 
 static void saveCurrentPage() {
   if (!g.canvas) return;
+  QMap<int, QPixmap*>& cache = activeCache();
   // 限制缓存页数
-  if (g.slideCache.size() >= (unsigned)g.maxCachePages && !g.slideCache.contains(g.currentSlide)) return;
+  if (cache.size() >= (unsigned)g.maxCachePages && !cache.contains(g.currentSlide)) return;
   // 深拷贝当前画布
-  delete g.slideCache.value(g.currentSlide);
-  g.slideCache[g.currentSlide] = new QPixmap(*g.canvas);
+  delete cache.value(g.currentSlide);
+  cache[g.currentSlide] = new QPixmap(*g.canvas);
 }
 
 static void loadPage(int page) {
   if (!g.canvas) return;
   g.canvas->fill(Qt::transparent);
-  QPixmap* cached = g.slideCache.value(page, nullptr);
+  QPixmap* cached = activeCache().value(page, nullptr);
   if (cached) {
     QPainter p(g.canvas);
     p.drawPixmap(0, 0, *cached);
@@ -2020,7 +2082,7 @@ static void openSettings() {
   lay->addWidget(clearLogBtn);
 
   // 版权信息
-  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.3-Geo   © 2026 Carl_Jin\nGNU GPL v3"));
+  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.4-Geo   © 2026 Carl_Jin\nGNU GPL v3"));
   creditLbl->setAlignment(Qt::AlignCenter);
   creditLbl->setStyleSheet("color:#556;font-size:11px;");
   lay->addWidget(creditLbl);
@@ -2033,7 +2095,20 @@ static void openSettings() {
   QObject::connect(doneBtn, &QPushButton::clicked, []() { closeSettings(); });
   lay->addWidget(doneBtn);
 
-  // 窗口关闭（点 X / 完成）恢复画布并复位指针
+  // 退出软件（独立按键 + 确认弹窗；窗口右上角 X 只关闭设置、不会退出）
+  QPushButton* quitBtn = new QPushButton(QString::fromUtf8("退出软件"));
+  quitBtn->setStyleSheet("QPushButton{background:#8a2f2f;color:#fff;padding:10px;border-radius:6px;}"
+                         "QPushButton:hover{background:#a83a3a;}");
+  QObject::connect(quitBtn, &QPushButton::clicked, [win]() {
+    QMessageBox box(QMessageBox::Question, QString::fromUtf8("退出"),
+                    QString::fromUtf8("确定要退出 Sidera 吗？"),
+                    QMessageBox::Yes | QMessageBox::No, win);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() == QMessageBox::Yes) QApplication::quit();
+  });
+  lay->addWidget(quitBtn);
+
+  // 窗口关闭（点 X / 完成）恢复画布并复位指针（不退出软件）
   QObject::connect(win, &QWidget::destroyed, []() {
     g.settingsWin = nullptr;
     restoreCanvasAfterSettings();
