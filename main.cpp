@@ -100,11 +100,10 @@ struct AppState {
   QPushButton* cursorBtn = nullptr;
   QPushButton* penBtn    = nullptr;
   QPushButton* eraserBtn = nullptr;
-  QPushButton* lineBtn   = nullptr;   // 直线
 
   // 右侧镜像
   QWidget* sidebarAreaRight = nullptr;
-  QPushButton *cursorBtnR = nullptr, *penBtnR = nullptr, *eraserBtnR = nullptr, *lineBtnR = nullptr;
+  QPushButton *cursorBtnR = nullptr, *penBtnR = nullptr, *eraserBtnR = nullptr;
 
   QWidget* penPopup      = nullptr;
   QWidget* eraserPopup   = nullptr;
@@ -136,9 +135,6 @@ struct AppState {
   // 绘图状态
   bool   isDrawing = false;
   QPoint lastPt;
-  // 直线模式
-  QPoint lineStart;
-  bool   linePreview = false;
 
   // 侧边栏屏幕坐标（手动跟踪，避免 mapToGlobal 的累积误差）
   QPoint sidebarScreenPos;
@@ -148,7 +144,6 @@ struct AppState {
   QPixmap* iconCursor = nullptr;
   QPixmap* iconPen    = nullptr;
   QPixmap* iconEraser = nullptr;
-  QPixmap* iconLine   = nullptr;
 
   // 侧边栏缩放系数（0.6 ~ 1.4，1.0 为默认）
   double sbScale = 1.0;
@@ -187,6 +182,9 @@ struct AppState {
   // 手掌自动橡皮（试验，默认开，设置里可关）：多点触控=手掌临时当橡皮
   bool palmEraseOn = true;
   QVector<QPoint> palmErasePreview;   // 当前作为“橡皮”的触点位置（画圆形预览用）
+
+  // 右键 → 虚拟右键 + 归位光标模式（试验，默认开）
+  bool rightClickCursorOn = true;
 };
 
 // 手掌橡皮直径（“大号”擦除尺寸）
@@ -218,7 +216,9 @@ static void updateWhiteboardButtonStyles();
 static void exitPresentation();
 static void showMoreMenu(QPushButton* b);
 static void doScreenshot();
+static void clearCurrentStrokes();
 static void sendXTestKey(Display* dpy, KeySym ks);
+static void doVirtualRightClick(const QPoint& globalPos);
 static void goToPrevPage();
 static void goToNextPage();
 static void clearAllPages();
@@ -279,13 +279,6 @@ static QPixmap makeEraserIcon(int s) {
   pt.setPen(QPen(QColor(255,180,180),2.5,Qt::SolidLine,Qt::RoundCap,Qt::RoundJoin));
   pt.setBrush(QColor(255,150,150,200));
   pt.drawRoundedRect(QRectF(m*1.5f,m,s-m*3,s-m*2),m*0.8f,m*0.8f);
-  pt.end(); return p;
-}
-static QPixmap makeLineIcon(int s) {
-  QPixmap p(s,s); p.fill(Qt::transparent);
-  QPainter pt(&p); pt.setRenderHint(QPainter::Antialiasing,true);
-  pt.setPen(QPen(QColor(200,200,255),3,Qt::SolidLine,Qt::RoundCap));
-  pt.drawLine(QPointF(s*0.2,s*0.8), QPointF(s*0.8,s*0.2));
   pt.end(); return p;
 }
 
@@ -358,8 +351,8 @@ static int sbBtn()    { return int(34 * g.sbScale); }
 static int sbIcon()   { return int(24 * g.sbScale); }
 static int sbDot()    { return int(19 * g.sbScale); }
 // 高度 = 固定 margins/spacing + 8 个按钮（间距 7 个 + 上下边距 18/14）
-// 高度 = 固定 margins + 8 个普通按钮 + 1 个高退出键(3×) + 8 个间距
-static int sbHeight() { return 18 + 14 + 11 * sbBtn() + 8 * 8; }
+// 高度 = 固定 margins + 9 个普通按钮 + 1 个高退出键(3×) + 9 个间距
+static int sbHeight() { return 18 + 14 + 12 * sbBtn() + 9 * 8; }
 
 // 画/擦一段到 g.canvas（显式指定动作与宽度，触摸/鼠标共用）
 static void strokeSegment(QPoint a, QPoint b, bool erase, int width) {
@@ -402,7 +395,6 @@ protected:
       QMouseEvent* me = static_cast<QMouseEvent*>(ev);
       // 点击侧边栏时终止主画布的进行中笔画（鼠标画线拖到侧边栏上松开时，release 事件给侧边栏，主画布收不到）
       g.isDrawing   = false;
-      g.linePreview = false;
       if (qobject_cast<QPushButton*>(w ? w->childAt(me->pos()) : nullptr)) return false;
       if (me->button() == Qt::LeftButton) {
         dragging = true;
@@ -466,7 +458,6 @@ public:
     g.iconCursor = new QPixmap(makeCursorIcon(isz));
     g.iconPen    = new QPixmap(makePenIcon(isz));
     g.iconEraser = new QPixmap(makeEraserIcon(isz));
-    g.iconLine   = new QPixmap(makeLineIcon(isz));
 
     // 创建侧边栏（子控件）
     buildSidebar();
@@ -520,13 +511,16 @@ public:
     QObject::connect(eraserB, &QPushButton::clicked, [this, isRight]() { g.popupOnRight = isRight; MainWidget::onEraserClicked(); });
     lay->addWidget(eraserB);
 
-    // 更多功能（省略号）——打开子菜单（截图等）
-    QPushButton* moreB = new QPushButton(QString::fromUtf8("\342\213\257"));   // ⋯
-    moreB->setFixedSize(sbBtn(), sbBtn());
-    moreB->setStyleSheet(QString("QPushButton{background:transparent;border:2px solid transparent;border-radius:%1px;font-size:%2px;font-weight:bold;color:#ddd;}"
-                         "QPushButton:hover{background:rgba(255,255,255,0.1);}").arg(sbBtn()/2).arg(sbBtn()*16/38));
-    QObject::connect(moreB, &QPushButton::clicked, [moreB]() { showMoreMenu(moreB); });
-    lay->addWidget(moreB);
+    // 清除键：青色圆角矩形“清除”，清当前页笔迹并归位光标模式
+    QPushButton* clearB = new QPushButton(QString::fromUtf8("清除"));
+    clearB->setFixedSize(sbBtn(), sbBtn());
+    clearB->setStyleSheet(QString("QPushButton{background:#00bcd4;color:#06343a;border:2px solid #4dd0e1;border-radius:%1px;font-weight:bold;font-size:%2px;}"
+                         "QPushButton:hover{background:#26c6da;}").arg(int(sbBtn()*0.35)).arg(sbBtn()*16/38));
+    QObject::connect(clearB, &QPushButton::clicked, []() {
+      clearCurrentStrokes();
+      switchToCursorMode();
+    });
+    lay->addWidget(clearB);
 
     sb->installEventFilter(new SidebarDragFilter(sb, isRight));
 
@@ -627,6 +621,20 @@ public:
     qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(wbL);
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(wbR);
 
+    // 更多功能（省略号）——放最底部
+    auto mkMore = []() {
+      QPushButton* b = new QPushButton(QString::fromUtf8("\342\213\257"));   // ⋯
+      b->setFixedSize(sbBtn(), sbBtn());
+      b->setStyleSheet(QString("QPushButton{background:transparent;border:2px solid transparent;border-radius:%1px;font-size:%2px;font-weight:bold;color:#ddd;}"
+                       "QPushButton:hover{background:rgba(255,255,255,0.1);}").arg(sbBtn()/2).arg(sbBtn()*16/38));
+      QObject::connect(b, &QPushButton::clicked, [b]() { showMoreMenu(b); });
+      return b;
+    };
+    QPushButton* moreL = mkMore();
+    QPushButton* moreR = mkMore();
+    qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(moreL);
+    qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(moreR);
+
     updateSidebarStyles();
     updateWhiteboardButtonStyles();
   }
@@ -650,18 +658,6 @@ public:
       switchToDrawMode(2);
     }
   }
-  static void onLineClicked() {
-    if (g.currentMode == 3) { return; }
-    closeAllPopups();
-    if (g.currentMode == 0) switchToDrawMode(3);
-    else {
-      // 直接从画笔/橡皮切到直线：重置画线状态，防止残留
-      g.isDrawing   = false;
-      g.linePreview = false;
-      g.currentMode = 3;
-    }
-    updateSidebarStyles();
-  }
 
   // ===== 绘制 =====
 protected:
@@ -674,12 +670,6 @@ protected:
     if (g.canvas) {
       p.setCompositionMode(QPainter::CompositionMode_SourceOver);
       p.drawPixmap(0, 0, *g.canvas);
-    }
-    if (g.currentMode == 3 && g.linePreview) {
-      QPen pen(g.penColor(), g.penWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-      p.setPen(pen);
-      p.setRenderHint(QPainter::Antialiasing, true);
-      p.drawLine(g.lineStart, g.lastPt);
     }
     // 手掌自动橡皮：圆形半透明预览（直径=擦除宽度）
     if (!g.palmErasePreview.isEmpty()) {
@@ -696,28 +686,25 @@ protected:
   }
 
   void mousePressEvent(QMouseEvent* ev) override {
-    if (g.currentMode == 3) {
-      if (ev->button() == Qt::LeftButton) {
-        g.lineStart = ev->pos();
-        g.linePreview = true;
-        g.lastPt = ev->pos();
-      }
+    if (g.currentMode == 0 || !g.canvas) return;
+    // 右键（实验）：把指针移到点击处注入虚拟右键 + 归位光标模式
+    if (ev->button() == Qt::RightButton) {
+      if (g.rightClickCursorOn) { doVirtualRightClick(ev->globalPos()); switchToCursorMode(); }
       return;
     }
-    if (g.currentMode == 0 || !g.canvas) return;
     if (ev->button() == Qt::LeftButton) {
       closeAllPopups();          // 开始绘画/擦除时自动关闭画笔/橡皮子菜单
       g.isDrawing = true;
       g.lastPt   = ev->pos();
+      // 落笔即画一个点，解决单击随机画不上点
+      if (g.currentMode == 2) strokeSegment(g.lastPt, g.lastPt, true, g.eraserWidth());
+      else                    strokeSegment(g.lastPt, g.lastPt, false, g.penWidth());
+      int w = g.currentMode == 2 ? g.eraserWidth() : g.penWidth();
+      update(QRect(g.lastPt, g.lastPt).adjusted(-w, -w, w, w));
     }
   }
 
   void mouseMoveEvent(QMouseEvent* ev) override {
-    if (g.currentMode == 3 && g.linePreview) {
-      g.lastPt = ev->pos();
-      update();
-      return;
-    }
     if (!g.isDrawing || !g.canvas || g.currentMode == 0) return;
     QPoint cur = ev->pos();
     QPoint prev = g.lastPt;
@@ -731,17 +718,6 @@ protected:
   }
 
   void mouseReleaseEvent(QMouseEvent* ev) override {
-    if (g.currentMode == 3 && g.linePreview) {
-      g.linePreview = false;
-      QPainter p(g.canvas);
-      QPen pen(g.penColor(), g.penWidth(), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-      p.setPen(pen);
-      p.setRenderHint(QPainter::Antialiasing, true);
-      p.drawLine(g.lineStart, g.lastPt);
-      p.end();
-      update();
-      return;
-    }
     Q_UNUSED(ev);
     if (g.isDrawing) { g.isDrawing = false; update(); }
   }
@@ -763,7 +739,6 @@ protected:
       if (inWidget(g.sidebarArea) || inWidget(g.sidebarAreaRight) ||
           inWidget(g.penPopup) || inWidget(g.eraserPopup)) {
         g.isDrawing   = false;
-        g.linePreview = false;
         return false;
       }
 
@@ -776,20 +751,17 @@ protected:
       switch (ev->type()) {
         case QEvent::TouchBegin: {
           closeAllPopups();          // 开始触摸即关闭画笔/橡皮子菜单
-          if (g.currentMode == 3) {
-            g.lineStart = cur;
-            g.linePreview = true;
-            g.lastPt = cur;
-          } else {
-            g.isDrawing = true;
-            g.lastPt = cur;
-          }
+          g.isDrawing = true;
+          g.lastPt = cur;
+          // 落点即画一个点（解决单击随机画不上点）
+          if (g.currentMode == 2) strokeSegment(cur, cur, true, g.eraserWidth());
+          else                    strokeSegment(cur, cur, false, g.penWidth());
+          int w = g.currentMode == 2 ? g.eraserWidth() : g.penWidth();
+          update(QRect(cur, cur).adjusted(-w, -w, w, w));
           break;
         }
         case QEvent::TouchUpdate: {
-          if (g.currentMode == 3) {
-            if (g.linePreview) { g.lastPt = cur; update(); }
-          } else if (g.isDrawing) {
+          if (g.isDrawing) {
             QPoint prev = g.lastPt;
             strokeToCanvas(prev, cur);
             g.lastPt = cur;
@@ -801,11 +773,7 @@ protected:
           break;
         }
         case QEvent::TouchEnd: {
-          if (g.currentMode == 3 && g.linePreview) {
-            g.linePreview = false;
-            strokeToCanvas(g.lineStart, g.lastPt);
-            update();
-          } else if (g.isDrawing) {
+          if (g.isDrawing) {
             g.isDrawing = false;
             update();
           }
@@ -835,10 +803,14 @@ protected:
     repositionPopups();
   }
 
-  // ---- 手掌自动橡皮（试验）：单点=笔；一旦多点，整体当橡皮（不“边写边擦”） ----
+  // ---- 手掌自动橡皮（试验）：单点=笔；一旦多点，锁存为橡皮直到全部抬手 ----
   QMap<int, QPoint> m_tPrevPos;
   QMap<int, int>    m_tPrevRole;      // 1=笔, 2=橡皮
   QVector<QPoint>  m_prevPreview;
+  bool   m_palmLatched = false;       // 本次触摸一旦多点，直到全部抬手都当橡皮
+  bool   m_tMoved = false;            // 本次手势是否产生过笔迹/擦除
+  QPoint m_tBeginPos;
+  int    m_tBeginRole = 0;
 
   void handlePalmTouch(QTouchEvent* te) {
     g.isDrawing = false;
@@ -851,8 +823,19 @@ protected:
     const int mode = g.currentMode;
     const bool modeEraseOnly = (mode == 2);
     const int n = now.size();
-    // 角色：仅剩 1 点才可能当笔；≥2 点全部当橡皮（直接切换，无并发画笔）
-    bool anyPen = (!modeEraseOnly && n == 1);
+
+    // 多点出现 → 锁存为橡皮，直到所有触点离开（避免抬手时序不同步留下痕迹）
+    if (n >= 2) {
+      m_palmLatched = true;
+    }
+    bool anyPen = (!modeEraseOnly && n == 1 && !m_palmLatched);
+
+    // 新手势开始
+    if (m_tPrevPos.isEmpty() && !now.isEmpty()) {
+      m_tMoved = false;
+      m_tBeginPos = now.first();
+      m_tBeginRole = modeEraseOnly ? 2 : (n == 1 ? 1 : 2);
+    }
 
     QMap<int,int> curRoleMap;
     for (auto it = now.begin(); it != now.end(); ++it) {
@@ -873,19 +856,16 @@ protected:
       if (oldPos == pos) continue;
 
       if (curRole == 1) {
-        if (mode == 1) {
-          strokeSegment(oldPos, pos, false, g.penWidth());
-          int w = g.penWidth();
-          QRect d(QRect(QPoint(qMin(oldPos.x(),pos.x()), qMin(oldPos.y(),pos.y())),
-                        QPoint(qMax(oldPos.x(),pos.x()), qMax(oldPos.y(),pos.y()))).adjusted(-w,-w,w,w));
-          update(d);
-        } else if (mode == 3) {
-          if (!g.linePreview) { g.lineStart = oldPos; g.linePreview = true; g.lastPt = oldPos; }
-          g.lastPt = pos;
-        }
-      } else {                                 // 橡皮（多点=手掌 / 橡皮模式）
+        strokeSegment(oldPos, pos, false, g.penWidth());
+        m_tMoved = true;
+        int w = g.penWidth();
+        QRect d(QRect(QPoint(qMin(oldPos.x(),pos.x()), qMin(oldPos.y(),pos.y())),
+                      QPoint(qMax(oldPos.x(),pos.x()), qMax(oldPos.y(),pos.y()))).adjusted(-w,-w,w,w));
+        update(d);
+      } else {                                 // 橡皮（多点锁存 / 橡皮模式）
         int ew = (mode == 2) ? g.eraserWidth() : kPalmEraseWidth;
         strokeSegment(oldPos, pos, true, ew);
+        m_tMoved = true;
         QRect d(QRect(QPoint(qMin(oldPos.x(),pos.x()), qMin(oldPos.y(),pos.y())),
                       QPoint(qMax(oldPos.x(),pos.x()), qMax(oldPos.y(),pos.y()))).adjusted(-ew,-ew,ew,ew));
         update(d);
@@ -893,9 +873,6 @@ protected:
       m_tPrevPos[id] = pos;
       m_tPrevRole[id] = curRole;
     }
-
-    // 进入多点时取消直线预览（整体切橡皮）
-    if (n >= 2) g.linePreview = false;
 
     // 清理抬起的触点
     for (auto it = m_tPrevPos.begin(); it != m_tPrevPos.end();) {
@@ -921,11 +898,14 @@ protected:
 
     if (now.isEmpty()) {
       g.palmErasePreview.clear();
-      if (mode == 3 && g.linePreview) {          // 结束直线
-        g.linePreview = false;
-        strokeSegment(g.lineStart, g.lastPt, false, g.penWidth());
+      if (!m_tMoved && !m_palmLatched && mode != 0) {
+        // 单击（没有移动）：补一个点/擦除点，解决“随机画不上点”
+        if (m_tBeginRole == 1) strokeSegment(m_tBeginPos, m_tBeginPos, false, g.penWidth());
+        else { int ew = (mode == 2) ? g.eraserWidth() : kPalmEraseWidth;
+               strokeSegment(m_tBeginPos, m_tBeginPos, true, ew); }
       }
       m_prevPreview.clear();
+      m_tMoved = false; m_tBeginRole = 0; m_palmLatched = false;
       update();
     }
   }
@@ -1049,7 +1029,6 @@ static void switchToCursorMode() {
 
   // 清空绘图状态并释放鼠标抓取（中断笔画也不残留）
   g.isDrawing = false;
-  g.linePreview = false;
   g.mainWidget->releaseMouse();
 
   // 只切模式，光标模式只侧边栏可点击，其余穿透桌面
@@ -1065,9 +1044,8 @@ static void switchToDrawMode(int mode) {
   g.currentMode = mode;
   if (!g.mainWidget || !g.sidebarArea) return;
 
-  // 清空绘图状态，避免残留的 isDrawing/linePreview 导致幽灵线
+  // 清空绘图状态，避免残留 isDrawing 导致幽灵线
   g.isDrawing = false;
-  g.linePreview = false;
 
   // 只在窗口非全屏时扩窗（首次启动或从缩小的光标模式进入）
   QRect scr = QGuiApplication::primaryScreen()->geometry();
@@ -1097,7 +1075,7 @@ static void switchToDrawMode(int mode) {
   if (g.nextBtn) g.nextBtn->setVisible(true);
   resetInputShape();
 
-  qDebug() << "[INFO] 绘画模式:" << (mode == 1 ? "画笔" : (mode == 2 ? "橡皮擦" : "直线"));
+  qDebug() << "[INFO] 绘画模式:" << (mode == 1 ? "画笔" : "橡皮擦");
 }
 
 static void updateSidebarStyles() {
@@ -1274,6 +1252,15 @@ static void doScreenshot() {
   }
 }
 
+// 清除当前页笔迹（清画布 + 丢弃当前页缓存）
+static void clearCurrentStrokes() {
+  QMap<int, QPixmap*>& c = activeCache();
+  if (c.contains(g.currentSlide)) { delete c.take(g.currentSlide); }
+  if (g.canvas) g.canvas->fill(Qt::transparent);
+  if (g.mainWidget) g.mainWidget->update();
+  qDebug() << "[INFO] 已清除当前页笔迹";
+}
+
 // 更多功能子菜单（省略号按钮）——先放“截图”，后续可扩展
 static void showMoreMenu(QPushButton* b) {
   if (!b) return;
@@ -1293,6 +1280,19 @@ static void sendXTestKey(Display* dpy, KeySym ks) {
   XTestFakeKeyEvent(dpy, kc, True,  0);
   XTestFakeKeyEvent(dpy, kc, False, 0);
   XFlush(dpy);
+}
+
+// 把指针移到指定屏幕坐标并注入一次鼠标右键（button 3）
+static void doVirtualRightClick(const QPoint& globalPos) {
+  Display* dpy = g.xDisplay;
+  bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }
+  if (!dpy) return;
+  XTestFakeMotionEvent(dpy, -1, globalPos.x(), globalPos.y(), 0);
+  XTestFakeButtonEvent(dpy, 3, True,  0);
+  XTestFakeButtonEvent(dpy, 3, False, 0);
+  XFlush(dpy);
+  if (nc) XCloseDisplay(dpy);
+  qDebug() << "[INFO] 虚拟右键已发送于" << globalPos << "（并归位光标模式）";
 }
 
 // ============================================================
@@ -1322,9 +1322,7 @@ static void clearAllPages() {
 
   // 重置绘图状态，防止残留（幽灵线 / 未完成的笔画）
   g.isDrawing   = false;
-  g.linePreview = false;
   g.lastPt  = QPoint();
-  g.lineStart = QPoint();
 
   // 清空当前画布
   if (g.canvas) g.canvas->fill(Qt::transparent);
@@ -1399,6 +1397,7 @@ static void wpsSaveSettings() {
   ts << "sbScale=" << QString::number(g.sbScale, 'f', 2) << "\n";
   ts << "sidebarAlpha=" << g.sidebarAlpha << "\n";
   ts << "palmErase=" << (g.palmEraseOn ? 1 : 0) << "\n";
+  ts << "rightClickCursor=" << (g.rightClickCursorOn ? 1 : 0) << "\n";
   f.close();
 }
 static void wpsLoadSettings() {
@@ -1414,6 +1413,7 @@ static void wpsLoadSettings() {
     else if (k == "sbScale") g.sbScale = qBound(0.6, v.toDouble(), 1.4);
     else if (k == "sidebarAlpha") g.sidebarAlpha = qBound(30, v.toInt(), 255);
     else if (k == "palmErase") g.palmEraseOn = (v == "1");
+    else if (k == "rightClickCursor") g.rightClickCursorOn = (v == "1");
   }
   f.close();
 }
@@ -1870,8 +1870,8 @@ static void rebuildSidebars() {
   // 删除旧侧边栏
   delete g.sidebarArea; g.sidebarArea = nullptr;
   delete g.sidebarAreaRight; g.sidebarAreaRight = nullptr;
-  g.cursorBtn = g.penBtn = g.eraserBtn = g.lineBtn = nullptr;
-  g.cursorBtnR = g.penBtnR = g.eraserBtnR = g.lineBtnR = nullptr;
+  g.cursorBtn = g.penBtn = g.eraserBtn = nullptr;
+  g.cursorBtnR = g.penBtnR = g.eraserBtnR = nullptr;
   g.prevBtn = g.nextBtn = nullptr;
   g.wbBtnL = g.wbBtnR = nullptr;
   // 重建
@@ -2065,10 +2065,30 @@ static void openSettings() {
     updatePalmBtn();
   });
   lay->addWidget(palmBtn);
-  QLabel* palmHint = new QLabel(QString::fromUtf8("画笔/直线模式下手掌(多点)临时当大号橡皮，单点恢复笔；橡皮/光标模式不受影响。"));
+  QLabel* palmHint = new QLabel(QString::fromUtf8("画笔模式下手掌(多点)临时当大号橡皮，单点恢复笔；橡皮/光标模式不受影响。"));
   palmHint->setWordWrap(true);
   palmHint->setStyleSheet("color:#667;font-size:11px;");
   lay->addWidget(palmHint);
+
+  // 右键/触摸长按 → 虚拟右键 + 归位光标模式（实验，默认关）
+  QPushButton* rcBtn = new QPushButton();
+  auto updateRcBtn = [rcBtn]() {
+    bool on = g.rightClickCursorOn;
+    rcBtn->setText(on ? QString::fromUtf8("右键归位光标(试验): 开") : QString::fromUtf8("右键归位光标(试验): 关"));
+    rcBtn->setStyleSheet(on ? "QPushButton{background:#2a5a6a;color:#fff;border:1px solid #4dd0e1;border-radius:6px;padding:8px;}"
+                            : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
+  };
+  updateRcBtn();
+  QObject::connect(rcBtn, &QPushButton::clicked, [updateRcBtn]() {
+    g.rightClickCursorOn = !g.rightClickCursorOn;
+    wpsSaveSettings();
+    updateRcBtn();
+  });
+  lay->addWidget(rcBtn);
+  QLabel* rcHint = new QLabel(QString::fromUtf8("画笔/橡皮模式下：鼠标右键 → 在指针处向 PPT 发虚拟右键并回光标模式（触摸长按不处理，交给系统）。"));
+  rcHint->setWordWrap(true);
+  rcHint->setStyleSheet("color:#667;font-size:11px;");
+  lay->addWidget(rcHint);
 
   // 清空调试日志（防止不熟悉的人让日志越积越多）
   QPushButton* clearLogBtn = new QPushButton(QString::fromUtf8("清空调试日志"));
@@ -2082,7 +2102,7 @@ static void openSettings() {
   lay->addWidget(clearLogBtn);
 
   // 版权信息
-  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.4-Geo   © 2026 Carl_Jin\nGNU GPL v3"));
+  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.5-Geo-testing   © 2026 Carl_Jin\nGNU GPL v3"));
   creditLbl->setAlignment(Qt::AlignCenter);
   creditLbl->setStyleSheet("color:#556;font-size:11px;");
   lay->addWidget(creditLbl);
@@ -2164,7 +2184,7 @@ static QString collectSystemInfo() {
   if (sc) s += "屏幕: " + QString::number(sc->geometry().width()) + "x" + QString::number(sc->geometry().height()) + "\n";
 
   if (g.mainWidget) {
-    s += "模式: " + QString(g.currentMode == 0 ? "光标" : (g.currentMode == 1 ? "画笔" : (g.currentMode == 2 ? "橡皮" : "直线"))) + "\n";
+    s += "模式: " + QString(g.currentMode == 0 ? "光标" : (g.currentMode == 1 ? "画笔" : "橡皮")) + "\n";
     s += "画布: 可见=" + QString(g.mainWidget->isVisible() ? "是" : "否")
        + " pos=(" + QString::number(g.mainWidget->pos().x()) + "," + QString::number(g.mainWidget->pos().y()) + ")"
        + " size=(" + QString::number(g.mainWidget->width()) + "x" + QString::number(g.mainWidget->height()) + ")"
@@ -2370,7 +2390,7 @@ int main(int argc, char* argv[]) {
     delete g.iconCursor; g.iconCursor = nullptr;
     delete g.iconPen; g.iconPen = nullptr;
     delete g.iconEraser; g.iconEraser = nullptr;
-    delete g.iconLine; g.iconLine = nullptr;
+
   });
 
   // 调试模式启动：已由 wpsLoadSettings 载入 g.wpsDebug；环境变量仅本次运行覆盖（不落盘）

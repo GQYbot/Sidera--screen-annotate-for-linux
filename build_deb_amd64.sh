@@ -1,13 +1,13 @@
 #!/bin/bash
 # amd64 deb 打包脚本
 # 用法: ./build_deb_amd64.sh
-# 产物: sidera_2.4-Geo_amd64.deb
+# 产物: sidera_2.5-Geo-testing_amd64.deb
 
 set -e
 
 BINARY="annotate_amd64"
 PKG_NAME="sidera"
-VERSION="2.4-Geo"
+VERSION="2.5-Geo-testing"
 ARCH="amd64"
 
 if [ ! -f "$BINARY" ]; then
@@ -47,7 +47,7 @@ Architecture: ${ARCH}
 Maintainer: User <user@localhost>
 Depends: libqt5core5a (>= 5.12), libqt5gui5 (>= 5.12), libqt5widgets5 (>= 5.12), libx11-6, libxcb1, libxtst6, libxext6
 Description: Sidera 软件
- 全屏透明画布批注工具，支持画笔/橡皮擦/直线，触控屏友好。
+ 全屏透明画布批注工具，支持画笔/橡皮擦与白板，触控屏友好。
  启动后显示左右两个胶囊形侧边栏，侧边栏 ⛶ 按钮可退出全屏。
  附带 WPS 演示联动加载项：设置里开启“WPS接口调试”后，
  批注缓存随真实换页驱动（页内动画不动批注）。
