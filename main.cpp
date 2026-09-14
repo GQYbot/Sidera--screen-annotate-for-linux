@@ -119,6 +119,12 @@ struct AppState {
   QPushButton* wbBtnL = nullptr;
   QPushButton* wbBtnR = nullptr;
 
+  // 侧边栏收缩
+  bool collapsed = false;
+  QPushButton* collapseBtnL = nullptr;
+  QPushButton* collapseBtnR = nullptr;
+  QTimer* sidebarIdleTimer = nullptr;   // 3 分钟无操作自动收缩
+
   // 颜色 + 粗细
   QVector<QColor> colors     = { QColor(255,40,40), QColor(50,120,255), QColor(40,200,60), QColor(255,210,30), QColor(240,240,240),
                                  QColor("#4DD0E1"), QColor("#AB47BC"), QColor("#C9DD22") };
@@ -180,7 +186,6 @@ struct AppState {
   int          wpsRealPos       = -1;   // 加载项上报的真实页号（1 起）
 
   // 手掌自动橡皮（试验，默认开，设置里可关）：多点触控=手掌临时当橡皮
-  bool palmEraseOn = true;
   QVector<QPoint> palmErasePreview;   // 当前作为“橡皮”的触点位置（画圆形预览用）
 
   // 右键 → 虚拟右键 + 归位光标模式（试验，默认开）
@@ -217,6 +222,11 @@ static void exitPresentation();
 static void showMoreMenu(QPushButton* b);
 static void doScreenshot();
 static void clearCurrentStrokes();
+static void toggleSidebarCollapse();
+static void collapseSidebars();
+static void expandSidebars();
+static void updateCollapseButtons();
+static void restartIdleTimer();
 static void sendXTestKey(Display* dpy, KeySym ks);
 static void doVirtualRightClick(const QPoint& globalPos);
 static void goToPrevPage();
@@ -351,8 +361,8 @@ static int sbBtn()    { return int(34 * g.sbScale); }
 static int sbIcon()   { return int(24 * g.sbScale); }
 static int sbDot()    { return int(19 * g.sbScale); }
 // 高度 = 固定 margins/spacing + 8 个按钮（间距 7 个 + 上下边距 18/14）
-// 高度 = 固定 margins + 9 个普通按钮 + 1 个高退出键(3×) + 9 个间距
-static int sbHeight() { return 18 + 14 + 12 * sbBtn() + 9 * 8; }
+// 高度 = 上下边距(12+10) + 10 个普通按钮 + 9 个间距(6)
+static int sbHeight() { return 22 + 10 * sbBtn() + 9 * 6; }
 
 // 画/擦一段到 g.canvas（显式指定动作与宽度，触摸/鼠标共用）
 static void strokeSegment(QPoint a, QPoint b, bool erase, int width) {
@@ -476,8 +486,19 @@ public:
     sb->installEventFilter(new SidebarPainter(sb));
 
     QVBoxLayout* lay = new QVBoxLayout(sb);
-    lay->setContentsMargins(12, 18, 12, 14);
-    lay->setSpacing(8);
+    lay->setContentsMargins(8, 12, 8, 10);
+    lay->setSpacing(6);
+
+    // 顶部：收缩/展开工具栏（黄色文字）
+    QPushButton* collapseB = new QPushButton(sb);
+    collapseB->setFixedSize(sbBtn(), sbBtn());
+    collapseB->setStyleSheet(QString(
+      "QPushButton{background:#222436;color:#ffd54a;border:2px solid rgba(255,213,74,0.6);"
+      "border-radius:%1px;font-weight:bold;font-size:%2px;}"
+      "QPushButton:hover{background:#2f3250;}").arg(sbBtn()/2).arg(sbBtn()*13/38));
+    QObject::connect(collapseB, &QPushButton::clicked, []() { toggleSidebarCollapse(); });
+    lay->addWidget(collapseB);
+    if (isRight) g.collapseBtnR = collapseB; else g.collapseBtnL = collapseB;
 
     QWidget* dragDot = new QWidget(sb);
     dragDot->setFixedSize(sbDot(), sbDot());
@@ -576,14 +597,14 @@ public:
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(prevB);
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(nextB);
 
-    // 退出放映按钮：长胶囊 + 竖排“退出放映”，醒目色；点击先回光标模式再发 ESC
+    // 退出放映按钮：正方形、直角矩形、两行“退出/放映”，略大字号；点击先回光标再发 ESC
     auto mkBigExit = []() {
-      QPushButton* b = new QPushButton(QString::fromUtf8("退\n出\n放\n映"));
-      b->setFixedSize(sbBtn(), sbBtn() * 3);
+      QPushButton* b = new QPushButton(QString::fromUtf8("退出\n放映"));
+      b->setFixedSize(sbBtn(), sbBtn());
       b->setStyleSheet(QString(
         "QPushButton{background:#d33a3a;color:#ffffff;border:2px solid #ff8080;"
-        "border-radius:%1px;font-weight:bold;font-size:%2px;}"
-        "QPushButton:hover{background:#ff4d4d;}").arg(sbBtn()/2).arg(sbBtn()*11/34));
+        "border-radius:4px;font-weight:bold;font-size:%1px;line-height:1;}"
+        "QPushButton:hover{background:#ff4d4d;}").arg(sbBtn()*12/34));
       return b;
     };
     QPushButton* exitL = mkBigExit();
@@ -592,21 +613,6 @@ public:
     QObject::connect(exitR, &QPushButton::clicked, []() { exitPresentation(); });
     qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(exitL);
     qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(exitR);
-
-    // 设置按钮（⚙）——打开独立设置窗口，左右各一个
-    auto mkSet = []() {
-      QPushButton* b = new QPushButton(QString::fromUtf8("\342\232\231"));
-      b->setFixedSize(sbBtn(), sbBtn());
-      b->setStyleSheet(QString("QPushButton{background:#3a4a4a;color:#aaddee;border:1.5px solid #55aacc;border-radius:%1px;font-size:%2px;font-weight:bold;}"
-                       "QPushButton:hover{background:#446666;color:#ffffff;}").arg(sbBtn()/2).arg(sbBtn()*12/19));
-      return b;
-    };
-    QPushButton* setL = mkSet();
-    QPushButton* setR = mkSet();
-    QObject::connect(setL, &QPushButton::clicked, []() { openSettings(); });
-    QObject::connect(setR, &QPushButton::clicked, []() { openSettings(); });
-    qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(setL);
-    qobject_cast<QVBoxLayout*>(rightSb->layout())->addWidget(setR);
 
     // 白板按钮（圆角矩形文字按钮）——左右各一个
     auto mkWB = [&](bool isRight) {
@@ -625,8 +631,8 @@ public:
     auto mkMore = []() {
       QPushButton* b = new QPushButton(QString::fromUtf8("\342\213\257"));   // ⋯
       b->setFixedSize(sbBtn(), sbBtn());
-      b->setStyleSheet(QString("QPushButton{background:transparent;border:2px solid transparent;border-radius:%1px;font-size:%2px;font-weight:bold;color:#ddd;}"
-                       "QPushButton:hover{background:rgba(255,255,255,0.1);}").arg(sbBtn()/2).arg(sbBtn()*16/38));
+      b->setStyleSheet(QString("QPushButton{background:rgba(199,125,255,0.35);border:2px solid rgba(231,180,255,0.8);border-radius:%1px;font-size:%2px;font-weight:bold;color:#fff;}"
+                       "QPushButton:hover{background:rgba(199,125,255,0.55);}").arg(sbBtn()/2).arg(sbBtn()*16/38));
       QObject::connect(b, &QPushButton::clicked, [b]() { showMoreMenu(b); });
       return b;
     };
@@ -637,6 +643,7 @@ public:
 
     updateSidebarStyles();
     updateWhiteboardButtonStyles();
+    updateCollapseButtons();
   }
 
   // ===== 按钮逻辑 =====
@@ -687,9 +694,9 @@ protected:
 
   void mousePressEvent(QMouseEvent* ev) override {
     if (g.currentMode == 0 || !g.canvas) return;
-    // 右键（实验）：把指针移到点击处注入虚拟右键 + 归位光标模式
+    // 右键（实验）：仅画笔模式下 → 指针处虚拟右键 + 归位光标模式（橡皮模式不处理）
     if (ev->button() == Qt::RightButton) {
-      if (g.rightClickCursorOn) { doVirtualRightClick(ev->globalPos()); switchToCursorMode(); }
+      if (g.rightClickCursorOn && g.currentMode == 1) { doVirtualRightClick(ev->globalPos()); switchToCursorMode(); }
       return;
     }
     if (ev->button() == Qt::LeftButton) {
@@ -745,42 +752,8 @@ protected:
       // 光标模式或画布无效 → 不画线，返回 false（Qt 合成鼠标或穿透桌面）
       if (g.currentMode == 0 || !g.canvas) return false;
 
-      // 手掌自动橡皮（试验）：开启时走多点手势引擎；关闭走原逻辑
-      if (g.palmEraseOn) { handlePalmTouch(te); return true; }
-
-      switch (ev->type()) {
-        case QEvent::TouchBegin: {
-          closeAllPopups();          // 开始触摸即关闭画笔/橡皮子菜单
-          g.isDrawing = true;
-          g.lastPt = cur;
-          // 落点即画一个点（解决单击随机画不上点）
-          if (g.currentMode == 2) strokeSegment(cur, cur, true, g.eraserWidth());
-          else                    strokeSegment(cur, cur, false, g.penWidth());
-          int w = g.currentMode == 2 ? g.eraserWidth() : g.penWidth();
-          update(QRect(cur, cur).adjusted(-w, -w, w, w));
-          break;
-        }
-        case QEvent::TouchUpdate: {
-          if (g.isDrawing) {
-            QPoint prev = g.lastPt;
-            strokeToCanvas(prev, cur);
-            g.lastPt = cur;
-            int w = g.currentMode == 2 ? g.eraserWidth() : g.penWidth();
-            QRect dirty(QPoint(qMin(prev.x(), cur.x()), qMin(prev.y(), cur.y())),
-                        QPoint(qMax(prev.x(), cur.x()), qMax(prev.y(), cur.y())));
-            update(dirty.adjusted(-w, -w, w, w));
-          }
-          break;
-        }
-        case QEvent::TouchEnd: {
-          if (g.isDrawing) {
-            g.isDrawing = false;
-            update();
-          }
-          break;
-        }
-        default: break;
-      }
+      // 多点触控手掌橡皮（正式功能）
+      handlePalmTouch(te);
       return true;  // 接受触摸，避免再合成鼠标事件导致重复处理
     }
     return QWidget::event(ev);
@@ -1071,8 +1044,8 @@ static void switchToDrawMode(int mode) {
   }
 
   updateSidebarStyles();
-  if (g.prevBtn) g.prevBtn->setVisible(true);
-  if (g.nextBtn) g.nextBtn->setVisible(true);
+  if (g.prevBtn) g.prevBtn->setVisible(!g.collapsed);
+  if (g.nextBtn) g.nextBtn->setVisible(!g.collapsed);
   resetInputShape();
 
   qDebug() << "[INFO] 绘画模式:" << (mode == 1 ? "画笔" : "橡皮擦");
@@ -1081,10 +1054,9 @@ static void switchToDrawMode(int mode) {
 static void updateSidebarStyles() {
   auto style = [](int m) {
     if (g.currentMode == m) {
-      if (m==0) return QString("QPushButton{background:rgba(255,255,255,0.2);border:2px solid #aaa;border-radius:19px;}");
-      if (m==1) return QString("QPushButton{background:rgba(255,100,100,0.3);border:2px solid #f66;border-radius:19px;}");
-      if (m==2) return QString("QPushButton{background:rgba(255,150,100,0.3);border:2px solid #f84;border-radius:19px;}");
-      return QString("QPushButton{background:rgba(255,255,255,0.2);border:2px solid #c9f;border-radius:19px;}");
+      // 选中模式：半透明蒂芙尼蓝 + 加亮边框
+      return QString("QPushButton{background:rgba(10,186,181,0.40);border:2px solid #7fe9e4;border-radius:19px;}"
+                     "QPushButton:hover{background:rgba(10,186,181,0.55);}");
     }
     return QString("QPushButton{background:transparent;border:2px solid transparent;border-radius:19px;}"
                    "QPushButton:hover{background:rgba(255,255,255,0.1);}");
@@ -1234,6 +1206,68 @@ static void exitPresentation() {
   qDebug() << "[INFO] 退出放映（已回光标模式并发送 ESC）";
 }
 
+// 当前模式归位光标、笔迹不清空 —— 见 collapseSidebars
+static void updateCollapseButtons() {
+  QString t = g.collapsed ? QString::fromUtf8("展开") : QString::fromUtf8("收缩");
+  if (g.collapseBtnL) g.collapseBtnL->setText(t);
+  if (g.collapseBtnR) g.collapseBtnR->setText(t);
+}
+
+static void collapseSidebars() {
+  if (g.collapsed || !g.sidebarArea) return;
+  g.collapsed = true;
+  if (g.currentMode != 0) switchToCursorMode();   // 收缩时归位光标模式，笔迹不清空
+  QWidget* sbs[2] = { g.sidebarArea, g.sidebarAreaRight };
+  for (QWidget* sb : sbs) {
+    if (!sb) continue;
+    for (QWidget* w : sb->findChildren<QWidget*>()) {
+      if (w == g.collapseBtnL || w == g.collapseBtnR) continue;
+      w->hide();
+    }
+    if (auto* lay = qobject_cast<QVBoxLayout*>(sb->layout())) {
+      lay->setContentsMargins(4, 6, 4, 6); lay->setSpacing(0);
+    }
+    sb->setFixedSize(sbWidth(), 6 + sbBtn() + 6);
+  }
+  updateCollapseButtons();
+  if (g.mainWidget) g.mainWidget->update();
+  if (g.currentMode == 0) setInputShapeToSidebar();
+  qDebug() << "[INFO] 侧边栏已收缩";
+}
+
+static void expandSidebars() {
+  if (!g.collapsed || !g.sidebarArea) return;
+  g.collapsed = false;
+  QWidget* sbs[2] = { g.sidebarArea, g.sidebarAreaRight };
+  for (QWidget* sb : sbs) {
+    if (!sb) continue;
+    for (QWidget* w : sb->findChildren<QWidget*>()) w->show();
+    if (auto* lay = qobject_cast<QVBoxLayout*>(sb->layout())) {
+      lay->setContentsMargins(8, 12, 8, 10); lay->setSpacing(6);
+    }
+    sb->setFixedSize(sbWidth(), sbHeight());
+  }
+  QRect scr = QGuiApplication::primaryScreen()->geometry();
+  int y = qMin(qMax(g.sidebarScreenPos.y(), 0), qMax(0, scr.height() - sbHeight()));
+  g.sidebarArea->move(4, y);
+  if (g.sidebarAreaRight) g.sidebarAreaRight->move(scr.width() - sbWidth() - 4, y);
+  g.sidebarScreenPos  = QPoint(4, y);
+  g.sidebarScreenPosR = QPoint(scr.width() - sbWidth() - 4, y);
+  updateCollapseButtons();
+  if (g.mainWidget) g.mainWidget->update();
+  if (g.currentMode == 0) setInputShapeToSidebar();
+  restartIdleTimer();
+  qDebug() << "[INFO] 侧边栏已展开";
+}
+
+static void toggleSidebarCollapse() {
+  if (g.collapsed) expandSidebars(); else collapseSidebars();
+}
+
+static void restartIdleTimer() {
+  if (g.sidebarIdleTimer && !g.collapsed) g.sidebarIdleTimer->start(3 * 60 * 1000); // 3 分钟
+}
+
 // 截图：抓当前主屏 → 存 PNG（图片目录）+ 复制到剪贴板
 static void doScreenshot() {
   QScreen* sc = QGuiApplication::primaryScreen();
@@ -1266,9 +1300,11 @@ static void showMoreMenu(QPushButton* b) {
   if (!b) return;
   QMenu m;
   QAction* shot = m.addAction(QString::fromUtf8("截图"));
+  QAction* set  = m.addAction(QString::fromUtf8("设置"));
   m.setStyleSheet("QMenu{background:#2b2b33;color:#eee;} QMenu::item{padding:8px 24px;} QMenu::item:selected{background:#444;}");
   QAction* chosen = m.exec(b->mapToGlobal(QPoint(0, b->height())));
   if (chosen == shot) doScreenshot();
+  else if (chosen == set) openSettings();
 }
 
 /*
@@ -1396,7 +1432,6 @@ static void wpsSaveSettings() {
   ts << "wpsDebug=" << (g.wpsDebug ? 1 : 0) << "\n";
   ts << "sbScale=" << QString::number(g.sbScale, 'f', 2) << "\n";
   ts << "sidebarAlpha=" << g.sidebarAlpha << "\n";
-  ts << "palmErase=" << (g.palmEraseOn ? 1 : 0) << "\n";
   ts << "rightClickCursor=" << (g.rightClickCursorOn ? 1 : 0) << "\n";
   f.close();
 }
@@ -1412,7 +1447,6 @@ static void wpsLoadSettings() {
     if (k == "wpsDebug") g.wpsDebug = (v == "1");
     else if (k == "sbScale") g.sbScale = qBound(0.6, v.toDouble(), 1.4);
     else if (k == "sidebarAlpha") g.sidebarAlpha = qBound(30, v.toInt(), 255);
-    else if (k == "palmErase") g.palmEraseOn = (v == "1");
     else if (k == "rightClickCursor") g.rightClickCursorOn = (v == "1");
   }
   f.close();
@@ -1813,8 +1847,8 @@ static void checkWpsState() {
   }
 
   // 翻页按钮始终显示
-  if (g.prevBtn) g.prevBtn->setVisible(true);
-  if (g.nextBtn) g.nextBtn->setVisible(true);
+  if (g.prevBtn) g.prevBtn->setVisible(!g.collapsed);
+  if (g.nextBtn) g.nextBtn->setVisible(!g.collapsed);
 
   // 光标模式下定期刷新输入区域，确保侧边栏可点击稳定（XShape 可能因时序/位置变化偶发失效）
   if (g.currentMode == 0) setInputShapeToSidebar();
@@ -1874,6 +1908,8 @@ static void rebuildSidebars() {
   g.cursorBtnR = g.penBtnR = g.eraserBtnR = nullptr;
   g.prevBtn = g.nextBtn = nullptr;
   g.wbBtnL = g.wbBtnR = nullptr;
+  g.collapseBtnL = g.collapseBtnR = nullptr;
+  g.collapsed = false;              // 重建后回到展开态
   // 重建
   mw->buildSidebar();
   // 恢复贴边位置（Y 保留原值，约束在新高度内）
@@ -2049,28 +2085,7 @@ static void openSettings() {
   lay->addWidget(wpsBtn);
   lay->addWidget(wpsHint);
 
-  // 手掌自动橡皮（试验，默认开）
-  QPushButton* palmBtn = new QPushButton();
-  auto updatePalmBtn = [palmBtn]() {
-    bool on = g.palmEraseOn;
-    palmBtn->setText(on ? QString::fromUtf8("手掌自动橡皮(试验): 开") : QString::fromUtf8("手掌自动橡皮(试验): 关"));
-    palmBtn->setStyleSheet(on ? "QPushButton{background:#4a3f6a;color:#fff;border:1px solid #8a6adf;border-radius:6px;padding:8px;}"
-                              : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
-  };
-  updatePalmBtn();
-  QObject::connect(palmBtn, &QPushButton::clicked, [palmBtn, updatePalmBtn]() {
-    g.palmEraseOn = !g.palmEraseOn;
-    g.palmErasePreview.clear();
-    wpsSaveSettings();
-    updatePalmBtn();
-  });
-  lay->addWidget(palmBtn);
-  QLabel* palmHint = new QLabel(QString::fromUtf8("画笔模式下手掌(多点)临时当大号橡皮，单点恢复笔；橡皮/光标模式不受影响。"));
-  palmHint->setWordWrap(true);
-  palmHint->setStyleSheet("color:#667;font-size:11px;");
-  lay->addWidget(palmHint);
-
-  // 右键/触摸长按 → 虚拟右键 + 归位光标模式（实验，默认关）
+  // 右键 → 虚拟右键 + 归位光标模式（实验，默认开）
   QPushButton* rcBtn = new QPushButton();
   auto updateRcBtn = [rcBtn]() {
     bool on = g.rightClickCursorOn;
@@ -2102,7 +2117,7 @@ static void openSettings() {
   lay->addWidget(clearLogBtn);
 
   // 版权信息
-  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.5-Geo-testing   © 2026 Carl_Jin\nGNU GPL v3"));
+  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.5-Geo   © 2026 Carl_Jin\nGNU GPL v3"));
   creditLbl->setAlignment(Qt::AlignCenter);
   creditLbl->setStyleSheet("color:#556;font-size:11px;");
   lay->addWidget(creditLbl);
@@ -2222,6 +2237,26 @@ static void showSystemInfo() {
 // ============================================================
 // 启动闪屏：屏幕中央小窗、青→粉渐变、底部进度条、右下角 byline
 // ============================================================
+// 全局输入监听：任意操作都刷新“空闲计时”，3 分钟无操作自动收缩侧边栏
+class IdleResetFilter : public QObject {
+public:
+  using QObject::QObject;
+protected:
+  bool eventFilter(QObject* obj, QEvent* ev) override {
+    switch (ev->type()) {
+      case QEvent::MouseButtonPress:
+      case QEvent::MouseMove:
+      case QEvent::TouchBegin:
+      case QEvent::TouchUpdate:
+      case QEvent::Wheel:
+        restartIdleTimer();
+        break;
+      default: break;
+    }
+    return QObject::eventFilter(obj, ev);
+  }
+};
+
 class SplashWindow : public QWidget {
 public:
   explicit SplashWindow() {
@@ -2314,7 +2349,10 @@ static void showSplashFor(QApplication& app) {
 // ============================================================
 int main(int argc, char* argv[]) {
   setupSoftwareRendering();
+  QCoreApplication::setAttribute(Qt::AA_CompressHighFrequencyEvents, false); // 触摸/鼠标移动不压缩，绘制更顺
   QApplication app(argc, argv);
+  app.setQuitOnLastWindowClosed(false);   // 关闭设置窗口不会退出整个进程
+  app.installEventFilter(new IdleResetFilter(&app));
 
   g.platform = detectPlatform();
   qDebug() << "[INFO] 平台:" << g.platform;
@@ -2376,6 +2414,11 @@ int main(int argc, char* argv[]) {
   });
 
   setupX11GlobalHotkey();
+
+  // 侧边栏空闲自动收缩：3 分钟无操作 → 收缩
+  g.sidebarIdleTimer = new QTimer(&app);
+  QObject::connect(g.sidebarIdleTimer, &QTimer::timeout, []() { collapseSidebars(); });
+  g.sidebarIdleTimer->start(3 * 60 * 1000);
 
   // WPS 全屏检测定时器（每 500ms 检查一次）
   QTimer* wpsTimer = new QTimer(&app);

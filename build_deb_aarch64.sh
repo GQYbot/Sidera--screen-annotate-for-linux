@@ -1,13 +1,13 @@
 #!/bin/bash
 # arm64 deb 打包脚本
 # 用法: ./build_deb_aarch64.sh
-# 产物: sidera_2.5-Geo-testing_arm64.deb
+# 产物: sidera_2.5-Geo_arm64.deb
 
 set -e
 
 BINARY="annotate_aarch64"
 PKG_NAME="sidera"
-VERSION="2.5-Geo-testing"
+VERSION="2.5-Geo"
 ARCH="arm64"
 
 if [ ! -f "$BINARY" ]; then
@@ -36,6 +36,8 @@ install -m 755 wps-addin/install.sh "${PKG_DIR}/usr/bin/sidera-wps-addin-install
 # ---------- 教室部署说明文档 ----------
 mkdir -p "${PKG_DIR}/usr/share/doc/sidera"
 cp README.classroom.md "${PKG_DIR}/usr/share/doc/sidera/README.classroom.md"
+cp LICENSE "${PKG_DIR}/usr/share/doc/sidera/copyright"
+cp LICENSE "${PKG_DIR}/usr/share/doc/sidera/LICENSE"
 
 # ---------- DEBIAN/control ----------
 cat > "${PKG_DIR}/DEBIAN/control" << EOF
