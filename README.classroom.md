@@ -1,8 +1,8 @@
-# Sidera 教室部署说明（2.5-Geo-unstable）
+# Sidera 教室部署说明（2.5-Geo-stable）
 
 ## 装（管理员）
 ```bash
-sudo dpkg -i sidera_2.5-Geo-unstable_arm64.deb    # arm64 教室机
+sudo dpkg -i sidera_2.5-Geo-stable_arm64.deb    # arm64 教室机
 # x86 机器用 _amd64.deb
 ```
 
