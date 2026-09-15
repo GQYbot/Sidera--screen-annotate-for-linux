@@ -226,7 +226,6 @@ static void toggleSidebarCollapse();
 static void collapseSidebars();
 static void expandSidebars();
 static void updateCollapseButtons();
-static void restartIdleTimer();
 static void sendXTestKey(Display* dpy, KeySym ks);
 static void doVirtualRightClick(const QPoint& globalPos);
 static void goToPrevPage();
@@ -378,7 +377,14 @@ static void strokeSegment(QPoint a, QPoint b, bool erase, int width) {
     p.setPen(pen);
     p.setRenderHint(QPainter::Antialiasing, true);
   }
-  p.drawLine(a, b);
+  if (a == b) {
+    // 同点：画/擦一个实心圆点，确保轻点一定可见
+    p.setPen(Qt::NoPen);
+    p.setBrush(erase ? QBrush(Qt::black) : QBrush(g.penColor()));
+    p.drawEllipse(QPointF(a), width / 2.0, width / 2.0);
+  } else {
+    p.drawLine(a, b);
+  }
   p.end();
 }
 
@@ -631,8 +637,8 @@ public:
     auto mkMore = []() {
       QPushButton* b = new QPushButton(QString::fromUtf8("\342\213\257"));   // ⋯
       b->setFixedSize(sbBtn(), sbBtn());
-      b->setStyleSheet(QString("QPushButton{background:rgba(199,125,255,0.35);border:2px solid rgba(231,180,255,0.8);border-radius:%1px;font-size:%2px;font-weight:bold;color:#fff;}"
-                       "QPushButton:hover{background:rgba(199,125,255,0.55);}").arg(sbBtn()/2).arg(sbBtn()*16/38));
+      b->setStyleSheet(QString("QPushButton{background:#000000;border:2px solid #333333;border-radius:%1px;font-size:%2px;font-weight:bold;color:#ffffff;}"
+                       "QPushButton:hover{background:#222222;}").arg(sbBtn()/2).arg(sbBtn()*16/38));
       QObject::connect(b, &QPushButton::clicked, [b]() { showMoreMenu(b); });
       return b;
     };
@@ -805,9 +811,16 @@ protected:
 
     // 新手势开始
     if (m_tPrevPos.isEmpty() && !now.isEmpty()) {
-      m_tMoved = false;
+      m_tMoved = true;                       // 视为已产生内容（落笔已画点）
       m_tBeginPos = now.first();
       m_tBeginRole = modeEraseOnly ? 2 : (n == 1 ? 1 : 2);
+      // 落笔即画点/擦除点，保证轻点与小范围作画可见
+      if (m_tBeginRole == 1) strokeSegment(m_tBeginPos, m_tBeginPos, false, g.penWidth());
+      else {
+        int ew = (mode == 2) ? g.eraserWidth() : kPalmEraseWidth;
+        strokeSegment(m_tBeginPos, m_tBeginPos, true, ew);
+      }
+      if (g.mainWidget) g.mainWidget->update();
     }
 
     QMap<int,int> curRoleMap;
@@ -1207,8 +1220,10 @@ static void exitPresentation() {
 }
 
 // 当前模式归位光标、笔迹不清空 —— 见 collapseSidebars
+static int collapsedH() { return sbBtn() * 3 + 12; }   // 竖胶囊高度（容纳 5 个竖排字）
+
 static void updateCollapseButtons() {
-  QString t = g.collapsed ? QString::fromUtf8("展开") : QString::fromUtf8("收缩");
+  QString t = g.collapsed ? QString::fromUtf8("展\n开\n侧\n边\n栏") : QString::fromUtf8("收缩");
   if (g.collapseBtnL) g.collapseBtnL->setText(t);
   if (g.collapseBtnR) g.collapseBtnR->setText(t);
 }
@@ -1227,17 +1242,28 @@ static void collapseSidebars() {
     if (auto* lay = qobject_cast<QVBoxLayout*>(sb->layout())) {
       lay->setContentsMargins(4, 6, 4, 6); lay->setSpacing(0);
     }
-    sb->setFixedSize(sbWidth(), 6 + sbBtn() + 6);
+    sb->setFixedSize(sbWidth(), collapsedH());
   }
+  if (g.collapseBtnL) g.collapseBtnL->setFixedSize(sbWidth() - 8, collapsedH() - 12);
+  if (g.collapseBtnR) g.collapseBtnR->setFixedSize(sbWidth() - 8, collapsedH() - 12);
+  // 保持在屏幕内
+  QRect scr = QGuiApplication::primaryScreen()->geometry();
+  int y = qMin(qMax(g.sidebarScreenPos.y(), 0), qMax(0, scr.height() - collapsedH()));
+  if (g.sidebarArea) g.sidebarArea->move(4, y);
+  if (g.sidebarAreaRight) g.sidebarAreaRight->move(scr.width() - sbWidth() - 4, y);
+  g.sidebarScreenPos = QPoint(4, y);
+  g.sidebarScreenPosR = QPoint(scr.width() - sbWidth() - 4, y);
   updateCollapseButtons();
   if (g.mainWidget) g.mainWidget->update();
   if (g.currentMode == 0) setInputShapeToSidebar();
+  if (g.sidebarIdleTimer) g.sidebarIdleTimer->start(2 * 60 * 1000);   // 收缩态：2 分钟后自动展开
   qDebug() << "[INFO] 侧边栏已收缩";
 }
 
 static void expandSidebars() {
   if (!g.collapsed || !g.sidebarArea) return;
   g.collapsed = false;
+  if (g.sidebarIdleTimer) g.sidebarIdleTimer->stop();
   QWidget* sbs[2] = { g.sidebarArea, g.sidebarAreaRight };
   for (QWidget* sb : sbs) {
     if (!sb) continue;
@@ -1247,6 +1273,8 @@ static void expandSidebars() {
     }
     sb->setFixedSize(sbWidth(), sbHeight());
   }
+  if (g.collapseBtnL) g.collapseBtnL->setFixedSize(sbBtn(), sbBtn());
+  if (g.collapseBtnR) g.collapseBtnR->setFixedSize(sbBtn(), sbBtn());
   QRect scr = QGuiApplication::primaryScreen()->geometry();
   int y = qMin(qMax(g.sidebarScreenPos.y(), 0), qMax(0, scr.height() - sbHeight()));
   g.sidebarArea->move(4, y);
@@ -1256,16 +1284,11 @@ static void expandSidebars() {
   updateCollapseButtons();
   if (g.mainWidget) g.mainWidget->update();
   if (g.currentMode == 0) setInputShapeToSidebar();
-  restartIdleTimer();
   qDebug() << "[INFO] 侧边栏已展开";
 }
 
 static void toggleSidebarCollapse() {
   if (g.collapsed) expandSidebars(); else collapseSidebars();
-}
-
-static void restartIdleTimer() {
-  if (g.sidebarIdleTimer && !g.collapsed) g.sidebarIdleTimer->start(3 * 60 * 1000); // 3 分钟
 }
 
 // 截图：抓当前主屏 → 存 PNG（图片目录）+ 复制到剪贴板
@@ -2117,7 +2140,7 @@ static void openSettings() {
   lay->addWidget(clearLogBtn);
 
   // 版权信息
-  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.5-Geo   © 2026 Carl_Jin\nGNU GPL v3"));
+  QLabel* creditLbl = new QLabel(QString::fromUtf8("Sidera 2.5-Geo-unstable   © 2026 Carl_Jin\nGNU GPL v3"));
   creditLbl->setAlignment(Qt::AlignCenter);
   creditLbl->setStyleSheet("color:#556;font-size:11px;");
   lay->addWidget(creditLbl);
@@ -2237,26 +2260,6 @@ static void showSystemInfo() {
 // ============================================================
 // 启动闪屏：屏幕中央小窗、青→粉渐变、底部进度条、右下角 byline
 // ============================================================
-// 全局输入监听：任意操作都刷新“空闲计时”，3 分钟无操作自动收缩侧边栏
-class IdleResetFilter : public QObject {
-public:
-  using QObject::QObject;
-protected:
-  bool eventFilter(QObject* obj, QEvent* ev) override {
-    switch (ev->type()) {
-      case QEvent::MouseButtonPress:
-      case QEvent::MouseMove:
-      case QEvent::TouchBegin:
-      case QEvent::TouchUpdate:
-      case QEvent::Wheel:
-        restartIdleTimer();
-        break;
-      default: break;
-    }
-    return QObject::eventFilter(obj, ev);
-  }
-};
-
 class SplashWindow : public QWidget {
 public:
   explicit SplashWindow() {
@@ -2352,7 +2355,6 @@ int main(int argc, char* argv[]) {
   QCoreApplication::setAttribute(Qt::AA_CompressHighFrequencyEvents, false); // 触摸/鼠标移动不压缩，绘制更顺
   QApplication app(argc, argv);
   app.setQuitOnLastWindowClosed(false);   // 关闭设置窗口不会退出整个进程
-  app.installEventFilter(new IdleResetFilter(&app));
 
   g.platform = detectPlatform();
   qDebug() << "[INFO] 平台:" << g.platform;
@@ -2415,10 +2417,10 @@ int main(int argc, char* argv[]) {
 
   setupX11GlobalHotkey();
 
-  // 侧边栏空闲自动收缩：3 分钟无操作 → 收缩
+  // 收缩态自动展开：仅当处于收缩时，2 分钟后自动展开（展开态不做任何自动化）
   g.sidebarIdleTimer = new QTimer(&app);
-  QObject::connect(g.sidebarIdleTimer, &QTimer::timeout, []() { collapseSidebars(); });
-  g.sidebarIdleTimer->start(3 * 60 * 1000);
+  g.sidebarIdleTimer->setSingleShot(true);
+  QObject::connect(g.sidebarIdleTimer, &QTimer::timeout, []() { if (g.collapsed) expandSidebars(); });
 
   // WPS 全屏检测定时器（每 500ms 检查一次）
   QTimer* wpsTimer = new QTimer(&app);
