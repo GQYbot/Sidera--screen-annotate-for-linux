@@ -1,13 +1,13 @@
 #!/bin/bash
 # amd64 deb 打包脚本
 # 用法: ./build_deb_amd64.sh
-# 产物: sidera_2.6-Geo-testing_amd64.deb
+# 产物: sidera_2.6-Geo-stable_amd64.deb
 
 set -e
 
 BINARY="annotate_amd64"
 PKG_NAME="sidera"
-VERSION="2.6-Geo-testing"
+VERSION="2.6-Geo-stable"
 ARCH="amd64"
 
 if [ ! -f "$BINARY" ]; then

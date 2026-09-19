@@ -1,13 +1,13 @@
 #!/bin/bash
 # arm64 deb 打包脚本
 # 用法: ./build_deb_aarch64.sh
-# 产物: sidera_2.6-Geo-testing_arm64.deb
+# 产物: sidera_2.6-Geo-stable_arm64.deb
 
 set -e
 
 BINARY="annotate_aarch64"
 PKG_NAME="sidera"
-VERSION="2.6-Geo-testing"
+VERSION="2.6-Geo-stable"
 ARCH="arm64"
 
 if [ ! -f "$BINARY" ]; then

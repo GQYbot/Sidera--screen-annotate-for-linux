@@ -1,5 +1,29 @@
+# ===== 交叉编译系统根（体积大，不入库）=====
 aarch64-sysroot/
 amd64-sysroot/
+
+# ===== 编译产物 =====
+annotate_*
+*.o
+*.obj
+*.a
+*.so
+*.new
+
+# ===== deb 打包产物与临时目录 =====
 *.deb
-annotate_aarch64
-annotate_amd64
+screen-annotate_*/
+sidera_*/
+build/
+
+# ===== 编辑器 / 系统杂项 =====
+*.swp
+*.swo
+*~
+.DS_Store
+compile_commands.json
+.cache/
+
+# 注意：.gitignore 只对“未跟踪”文件生效。
+# 若某个文件在加入本文件前已被 git 跟踪，需要手动取消跟踪：
+#   git rm -r --cached <path>
