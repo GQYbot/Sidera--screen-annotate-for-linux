@@ -170,6 +170,7 @@ static void wpsOnRealPos(int pos) {
 }
 
 static void wpsHandleLine(const QString& raw) {
+  if (g.whiteboard) return;                    // 白板模式：与外界完全隔离，忽略 WPS 事件
   QString line = raw.trimmed();
   if (line.isEmpty()) return;
   wpsLog("收 << " + line);
@@ -367,6 +368,13 @@ static void wpsServeAddinFile(QTcpSocket* s, const QString& path) {
 }
 
 void goToPrevPage() {
+  // 白板模式：完全本地翻页，绝不发送任何虚拟按键，与外界隔离
+  if (g.whiteboard) {
+    saveCurrentPage();
+    if (g.currentSlide > 1) g.currentSlide--;
+    loadPage(g.currentSlide);
+    return;
+  }
   // 调试模式：只“推进一步”，缓存由加载项回传的真实页号事件驱动（动画步不动缓存）
   bool debugNoCache = g.wpsDebug && g.wpsConnected;   // 无客户端时静默回退“点击即缓存”
   if (debugNoCache) wpsLog("调试：按钮仅发送 Up，缓存等待真实页号事件");
@@ -384,6 +392,13 @@ void goToPrevPage() {
 }
 
 void goToNextPage() {
+  // 白板模式：完全本地翻页，绝不发送任何虚拟按键，与外界隔离
+  if (g.whiteboard) {
+    saveCurrentPage();
+    g.currentSlide++;
+    loadPage(g.currentSlide);
+    return;
+  }
   // 调试模式：只“推进一步”，缓存由加载项回传的真实页号事件驱动（动画步不动缓存）
   bool debugNoCache = g.wpsDebug && g.wpsConnected;   // 无客户端时静默回退“点击即缓存”
   if (debugNoCache) wpsLog("调试：按钮仅发送 Down，缓存等待真实页号事件");
@@ -504,7 +519,10 @@ void checkWpsState() {
   if (needClose) XCloseDisplay(dpy);
 
   if (was != g.wpsFullscreen) {
-    if (g.wpsFullscreen) {
+    if (g.whiteboard) {
+      // 白板模式：与外界隔离，仅更新缓存上限，不清空白板笔迹
+      g.maxCachePages = g.wpsFullscreen ? 30 : 2;
+    } else if (g.wpsFullscreen) {
       // 进入全屏放映：清空所有笔迹 + 缓存上限 30 页
       qDebug() << "[INFO] 进入全屏放映，清空笔迹";
       clearAllPages();

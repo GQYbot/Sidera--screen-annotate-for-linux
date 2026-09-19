@@ -277,6 +277,8 @@ public:
     };
     QPushButton* exitL = mkBigExit();
     QPushButton* exitR = mkBigExit();
+    g.exitBtnL = exitL;
+    g.exitBtnR = exitR;
     QObject::connect(exitL, &QPushButton::clicked, []() { exitPresentation(); });
     QObject::connect(exitR, &QPushButton::clicked, []() { exitPresentation(); });
     qobject_cast<QVBoxLayout*>(leftSb->layout())->addWidget(exitL);
@@ -321,6 +323,7 @@ public:
     updateSidebarStyles();
     updateWhiteboardButtonStyles();
     updateCollapseButtons();
+    updateExitButtons();
   }
 
   // ===== 按钮逻辑 =====
@@ -348,7 +351,7 @@ protected:
   void paintEvent(QPaintEvent*) override {
     QPainter p(this);
     p.setCompositionMode(QPainter::CompositionMode_Source);
-    p.fillRect(rect(), g.whiteboard ? QColor(255, 255, 255) : Qt::transparent);
+    p.fillRect(rect(), g.whiteboard ? whiteboardBgColor() : Qt::transparent);
 
     // 始终画 Pixmap（光标模式下也可见）
     if (g.canvas) {

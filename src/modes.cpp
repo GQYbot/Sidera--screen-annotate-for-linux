@@ -166,7 +166,14 @@ void resetInputShape() {
 }
 
 void exitPresentation() {
-  if (g.whiteboard) toggleWhiteboard();
+  if (g.whiteboard) {
+    // 白板模式：该键改为切换白板背景色，不退出、不对外发键
+    g.whiteboardBgIndex = (g.whiteboardBgIndex + 1) % kWhiteboardColorCount;
+    updateExitButtons();
+    if (g.mainWidget) g.mainWidget->update();
+    qDebug() << "[INFO] 白板背景色切换为" << whiteboardBgColor().name();
+    return;
+  }
   if (g.currentMode != 0) switchToCursorMode();
   Display* dpy = g.xDisplay;
   bool nc = false; if (!dpy) { dpy = XOpenDisplay(nullptr); nc = true; }

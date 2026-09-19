@@ -48,6 +48,29 @@ void updateWhiteboardButtonStyles() {
   paint(g.wbBtnR);
 }
 
+// 退出放映键：普通模式=退出放映；白板模式=背景颜色切换键（并显示当前背景色）
+void updateExitButtons() {
+  auto paint = [](QPushButton* b) {
+    if (!b) return;
+    if (g.whiteboard) {
+      QColor c = whiteboardBgColor();
+      QString fg = (c.lightness() > 128) ? "#111111" : "#ffffff";
+      b->setText(QString::fromUtf8("背景\n颜色"));
+      b->setStyleSheet(QString(
+        "QPushButton{background:%1;color:%2;border:2px solid #ffffff;border-radius:4px;font-weight:bold;font-size:%3px;}"
+        "QPushButton:hover{background:%1;}").arg(c.name()).arg(fg).arg(sbBtn()*11/34));
+    } else {
+      b->setText(QString::fromUtf8("退出\n放映"));
+      b->setStyleSheet(QString(
+        "QPushButton{background:#d33a3a;color:#ffffff;border:2px solid #ff8080;"
+        "border-radius:4px;font-weight:bold;font-size:%1px;}"
+        "QPushButton:hover{background:#ff4d4d;}").arg(sbBtn()*12/34));
+    }
+  };
+  paint(g.exitBtnL);
+  paint(g.exitBtnR);
+}
+
 void toggleWhiteboard() {
   // 把当前笔迹存进“当前模式”的缓存，再切换模式并载入另一套缓存
   saveCurrentPage();
@@ -55,6 +78,7 @@ void toggleWhiteboard() {
   if (g.canvas) g.canvas->fill(Qt::transparent);   // 清空画布
   loadPage(g.currentSlide);                        // 载入新模式缓存（无则空白）
   updateWhiteboardButtonStyles();
+  updateExitButtons();
   clearUndo();
   if (g.mainWidget) {
     if (g.whiteboard) resetInputShape();          // 全屏可输入

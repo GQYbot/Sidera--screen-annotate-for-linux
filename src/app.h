@@ -99,6 +99,10 @@ struct AppState {
   bool whiteboard = false;
   QPushButton* wbBtnL = nullptr;
   QPushButton* wbBtnR = nullptr;
+  // 白板背景色索引（会话内记忆，重启回默认；0=墨绿 1=白，默认白）
+  int whiteboardBgIndex = 1;
+  QPushButton* exitBtnL = nullptr;   // 退出放映键（白板模式下变为“背景颜色”键）
+  QPushButton* exitBtnR = nullptr;
 
   // 侧边栏收缩
   bool collapsed = false;
@@ -208,6 +212,14 @@ static const int kMaxUndo = 12;
 
 extern AppState g;
 
+// 白板背景色：墨绿 / 白（默认索引见 AppState.whiteboardBgIndex）
+static const QColor kWhiteboardColors[] = { QColor("#0F3D2E"), QColor(255, 255, 255) };
+static const int    kWhiteboardColorCount = 2;
+inline QColor whiteboardBgColor() {
+  int i = qBound(0, g.whiteboardBgIndex, kWhiteboardColorCount - 1);
+  return kWhiteboardColors[i];
+}
+
 // 当前生效的笔迹缓存：白板模式与普通/放映模式各自独立
 QMap<int, QPixmap*>& activeCache();
 
@@ -234,6 +246,7 @@ int  sbDot();
 int  sbHeight();
 void updateSidebarStyles();
 void updateWhiteboardButtonStyles();
+void updateExitButtons();       // 退出键文字/样式（白板模式下变为背景颜色键）
 void toggleWhiteboard();
 void updateCollapseButtons();
 void collapseSidebars();
