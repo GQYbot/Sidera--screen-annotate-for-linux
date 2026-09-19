@@ -10,7 +10,11 @@ AppState g;
 // 3. 平台检测
 // ============================================================
 static QString detectPlatform() {
-  // 只支持 X11
+  QByteArray sessionType = qgetenv("XDG_SESSION_TYPE").toLower();
+  if (sessionType == "wayland") {
+    qWarning() << "[WARN] 检测到当前运行于 Wayland 会话环境，Sidera 将通过 XWayland 兼容层运行。";
+    return "wayland";
+  }
   return "x11";
 }
 
