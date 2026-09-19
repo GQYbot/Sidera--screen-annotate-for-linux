@@ -1,0 +1,37 @@
+name: Build & Verify
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            qtbase5-dev \
+            libqt5widgets5 \
+            libqt5network5 \
+            libx11-dev \
+            libxcb1-dev \
+            libxext-dev \
+            libxtst-dev
+
+      - name: Compile Sidera
+        run: |
+          make -j$(nproc)
+
+      - name: Verify build artifact
+        run: |
+          test -f annotate_amd64
+          echo "annotate_amd64 built successfully."

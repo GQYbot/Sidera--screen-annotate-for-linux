@@ -1,29 +1,24 @@
-# ===== 交叉编译系统根（体积大，不入库）=====
-aarch64-sysroot/
-amd64-sysroot/
+# Binaries
+annotate_amd64
+annotate_aarch64
+*.deb
 
-# ===== 编译产物 =====
-annotate_*
+# Build artifacts
 *.o
-*.obj
 *.a
 *.so
-*.new
-
-# ===== deb 打包产物与临时目录 =====
-*.deb
-screen-annotate_*/
-sidera_*/
 build/
+bin/
 
-# ===== 编辑器 / 系统杂项 =====
-*.swp
-*.swo
-*~
+# Qt moc and ui
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Editor / OS
 .DS_Store
-compile_commands.json
-.cache/
-
-# 注意：.gitignore 只对“未跟踪”文件生效。
-# 若某个文件在加入本文件前已被 git 跟踪，需要手动取消跟踪：
-#   git rm -r --cached <path>
+*.swp
+*~
+.vscode/
+.idea/
+*.user
