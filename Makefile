@@ -16,4 +16,7 @@ annotate_amd64: $(SRC) $(HDR)
 clean:
 	rm -f annotate_amd64 annotate_aarch64
 
-.PHONY: all clean
+test:
+	python3 tests/test_bridge_api.py
+
+.PHONY: all clean test
